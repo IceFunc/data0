@@ -282,7 +282,7 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
     'C6.8 用户回调抛错不冻结状态机': {
         section: '6.', kind: 'grant',
         quote: '**用户回调抛错不冻结状态机**',
-        assets: ['deepReview2026H3Round7.spec.ts'],
+        assets: ['deepReview2026H3Round7.spec.ts', 'throwingTeardown.spec.ts'],
     },
     // ── 支持矩阵章 ──
     'CM.1 增量格子双向可执行(零回退/必回退)': {

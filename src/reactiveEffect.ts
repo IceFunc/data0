@@ -1,4 +1,4 @@
-import {Dep, finalizeDepMarkers, initDepMarkers, pruneEmptyDepFromHost} from "./dep.js";
+import {Dep, finalizeDepMarkers, initDepMarkers, pruneEmptyDepFromHost, retainDepMarkers} from "./dep.js";
 import {maxMarkerBits, Notifier, notifier} from "./notify.js";
 import type {InputTriggerInfo, TriggerInfo} from "./notify.js";
 import type {TriggerOpTypes} from "./operations.js";
@@ -250,6 +250,11 @@ export class ReactiveEffect extends ManualCleanup {
 
     }
 
+    // CAUTION 原子性：要么完成，要么不留痕迹。销毁上一轮的子 effect 会执行用户清理，
+    //  清理抛错时这里撤销已做的一切（出栈、深度与 marker 位复原、保留上一轮的依赖、
+    //  执行期间登记的延迟销毁照常生效）再抛出。调用方因此可以把它放在 try 之外——
+    //  callSimpleGetter/callAsyncGetter 一直如此，若不撤销，宿主永久留在 activeScopes
+    //  上，之后任何顶层读取都会订阅它。
     prepareTracking(isFirst = false, isAsync = this.isAsync) {
         if (!isAsync) {
             Notifier.trackOpBit = 1 << ++notifier.effectTrackDepth
@@ -260,17 +265,23 @@ export class ReactiveEffect extends ManualCleanup {
             } else {
                 this.cleanup()
             }
-
-            this.destroyChildren()
-
         } else {
             // async 模式下是通过暂存一个 track 函数到 asyncTracks 中，然后在 completeTracking 时执行。
             // 所以这里只需要 push scope 就行了。
             ReactiveEffect.activeScopes.push(this)
-            if (isFirst) {
-                if (this._asyncTracks) this._asyncTracks.length = 0
-                this.destroyChildren()
-            }
+            if (!isFirst) return
+            if (this._asyncTracks) this._asyncTracks.length = 0
+        }
+
+        try {
+            this.destroyChildren()
+        } catch (err) {
+            // marker 模式下把上一轮的依赖全部视为本轮已收集，finalizeDepMarkers 保留它们并
+            // 复位位标记；full cleanup 模式的依赖已在上面清空，由调用方的错误恢复处理
+            // （Computed 的 restoreEffectDeps）。
+            if (!isAsync) retainDepMarkers(this)
+            this.completeTracking(false, isAsync)
+            throw err
         }
     }
 
@@ -364,9 +375,11 @@ export class ReactiveEffect extends ManualCleanup {
                 scopesDepthBefore = ReactiveEffect.activeScopes.length
                 trackStackDepthBefore = notifier.trackStack.length
             }
+            // prepareTracking 在 try 之外：失败时它自己撤销（见其说明），finally 若照常执行
+            // 会多弹一层 trackStack。
+            this.prepareTracking()
+            notifier.enableTracking()
             try {
-                this.prepareTracking()
-                notifier.enableTracking()
                 return this.callGetter()
             } finally {
                 notifier.resetTracking()
