@@ -360,12 +360,10 @@ describe('F8 destroy with a throwing context.onCleanup skips the rest of destroy
         const state = await Promise.race([p.then(() => 'settled', () => 'settled'), wait(30).then(() => 'pending')])
         expect(state).toBe('settled')
     })
-    // NOT FIXED HERE, kept as executable evidence (AGENTS §3 `test.fails`): the loop that runs the rows'
-    // `context.onCleanup` at destroy is the `cleanupSlots.forEach(slot => slot?.fn?.())` in the `onDestroy`
-    // callback of RxList.map — an operator body owned by the RxList reviewer — not `RxList.destroyResources`
-    // (my first report attributed it to the hook chain; that was wrong). Turn this back into `test(...)`
-    // once map's onDestroy collects the first error and keeps going.
-    test.fails('RxList.map onDestroy: rows after a throwing row cleanup are never cleaned', () => {
+    // The loop that runs the rows' `context.onCleanup` at destroy lives in the `onDestroy` callback of
+    // RxList.map (an operator body), not in `RxList.destroyResources`; it is fixed together with the
+    // other row-cleanup loops of `map` (see auditListFixes.spec.ts).
+    test('RxList.map onDestroy: rows after a throwing row cleanup are still cleaned', () => {
         const dep = atom(0)
         const source = new RxList<number>([1, 2, 3])
         const cleaned: number[] = []
