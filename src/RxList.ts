@@ -15,7 +15,7 @@ import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js"
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, toProtocolPayload, warn} from "./util.js";
 import {reconstructDigestStates} from "./digestReplay.js";
-import {isolateTeardown, ReactiveEffect} from "./reactiveEffect.js";
+import {isolateTeardown, ReactiveEffect, reportTeardownError} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
 // selection 家族(2026-H3 round6 拆分):实现在 rxListSelection.ts,类方法委托
@@ -2090,17 +2090,48 @@ export class RxList<T> extends Computed {
      * destroyChildren、destroyComputed 三个入口都恰好执行一次。
      */
     destroyResources() {
+        // CAUTION 本钩子里每一步都可能执行用户清理（行级 effect 的子 effect / context.onCleanup、
+        //  惰性 meta 的监听者、基类钩子里本结构自己的 context.onCleanup），任何一步抛错都不能
+        //  让后面的步骤被跳过（「销毁必须做完」，README §6）：曾是顺序执行，第一行的清理一抛错，
+        //  其余行的行级 effect 就不再销毁，基类钩子（lastCleanupFn、cleanPromise 的 settle）
+        //  也整个跳过。规则与静态销毁核心一致：全部做完，第一个错误抛给调用方，其后的错误走
+        //  reportTeardownError。
+        let failed = false
+        let first: unknown
+        const record = (error: unknown) => {
+            if (failed) {
+                reportTeardownError(error)
+            } else {
+                failed = true
+                first = error
+            }
+        }
         // CAUTION 用 _length 判断：length 是惰性 getter，直接访问会先创建再销毁
-        if (this._length) destroyComputed(this._length)
+        if (this._length) {
+            try {
+                destroyComputed(this._length)
+            } catch (error) {
+                record(error)
+            }
+        }
         this._effectFramesArray?.forEach((frames) => {
           // 稀疏行安全：越界 set + reorder 会在记账数组中留下显式 undefined 项
           frames?.forEach((frame) => {
-            this.destroyEffect(frame)
+            try {
+              this.destroyEffect(frame)
+            } catch (error) {
+              record(error)
+            }
           })
         })
         this._indexKeyDeps?.clear()
         this.atomIndexes = undefined
-        super.destroyResources()
+        try {
+            super.destroyResources()
+        } catch (error) {
+            record(error)
+        }
+        if (failed) throw first
     }
 
     createSelection(currentValues: RxSet<T|number>|Atom<T|null|number>, autoResetValue?: boolean) {
