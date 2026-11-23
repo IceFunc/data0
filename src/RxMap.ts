@@ -267,6 +267,7 @@ export class RxMap<K, V> extends Computed{
     declare _entries?: RxList<[K, V]>
     declare _size?: Atom<number>
     // size 的内部 Computed：判活用（atom 本身不带 active），与 _size 同时赋值
+    /** @internal */
     declare _sizeEffect?: Computed
     // CAUTION 缓存只在它还活着时复用：meta 是按需创建、全体使用方共享的单例，而 README §6
     //  让使用方对派生结构调用 destroy()——keys()/values() 在调用点上与 list.map() 无从区分。

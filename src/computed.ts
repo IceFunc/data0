@@ -1055,7 +1055,9 @@ export class Computed extends ReactiveEffect {
     }
     // 同步重算中又被触发时交给调度器的强制重算（见 handleTriggered）。惰性 bound：身份稳定，
     // 也省掉原来每次这样的触发都新建一个闭包。
+    /** @internal */
     _boundForcedRecompute?: () => void
+    /** @internal */
     get boundForcedRecompute() {
         return this._boundForcedRecompute ?? (this._boundForcedRecompute = () => this.forcedRecompute())
     }
@@ -1071,7 +1073,9 @@ export class Computed extends ReactiveEffect {
     //  run 返回后的检查点兑现（fullRecompute / patchRecompute 的同步收尾）。
     //  async patch 的同步段同样在栈上，但那里的新触发已经排进 _triggerInfos、由 patch 循环的
     //  下一轮消化，不需要也不应该再强制全量。
+    /** @internal */
     declare _rerunAfterRun: boolean
+    /** @internal */
     forcedRecompute() {
         if (ReactiveEffect.activeScopes.includes(this)) {
             if (!(this.isPatchAsync && this.inPatch)) this._rerunAfterRun = true

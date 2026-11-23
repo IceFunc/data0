@@ -2379,6 +2379,7 @@ export class RxList<T> extends Computed {
     //  解决旧注释里"在 autorun/computed 中读会被当作 children 误销毁"的问题。
     declare _length?: Atom<number>
     // length 的内部 Computed：判活用（atom 本身不带 active），与 _length 同时赋值
+    /** @internal */
     declare _lengthEffect?: Computed
     get length(): Atom<number> {
         // CAUTION 缓存只在它还活着时复用（规则与理由见 RxMap.keys 的同款说明）：length 是

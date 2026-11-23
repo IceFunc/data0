@@ -386,6 +386,7 @@ export class RxSet<T> extends Computed {
     // CAUTION size 惰性创建（createDetached 说明见 RxMap 的同名注释）
     declare _size?: Atom<number>
     // size 的内部 Computed：判活用（atom 本身不带 active），与 _size 同时赋值
+    /** @internal */
     declare _sizeEffect?: Computed
     get size(): Atom<number> {
         // CAUTION 缓存只在它还活着时复用（规则与理由见 RxMap.keys 的同款说明）：使用方
