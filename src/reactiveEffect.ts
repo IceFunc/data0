@@ -273,6 +273,8 @@ export class ReactiveEffect extends ManualCleanup {
             if (this._asyncTracks) this._asyncTracks.length = 0
         }
 
+        // 没有子 effect 就没有清理要跑、不会抛错：最热的路径（绑定类 effect 的重跑）不进 try。
+        if (this._children === undefined) return
         try {
             this.destroyChildren()
         } catch (err) {
