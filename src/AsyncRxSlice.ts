@@ -2,6 +2,7 @@ import {RxList} from "./RxList.js";
 import {Atom, atom} from "./atom.js";
 import {computed, destroyComputed} from "./computed.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
+import {warn} from "./util.js";
 
 type GetRemoteData<T> = (cursor?: number, length?: number, stop?: number, fetchBeforeCursor?: boolean) => Promise<T[]>
 
@@ -20,6 +21,16 @@ export class AsyncRxSlice<T> extends RxList<T>{
         super(cached)
     }
     fetch(): Promise<any>{
+        // CAUTION 已销毁实例不再发起拉取（destroy 后结构只读，README §6）：destroyResources
+        //  只能清理当时已存在的 autoFetchPromise，销毁后首次 fetch() 会新建一个**活的**
+        //  computed——立刻发一次远程请求、订阅 getRemoteData 读到的参数，此后参数每变一次
+        //  再发一次，且逃过一切销毁路径（destroy 幂等，已无人能销毁它）。与 RxList.length
+        //  的"已销毁结构的 meta 首读"同一等价类；这里连创建都不做：创建即发请求。
+        //  返回销毁前最后一次拉取的 promise（其结果已被 receipt 作废），没有则返回已完成的 promise。
+        if (!this.active) {
+            warn('fetching a destroyed AsyncRxSlice is a no-op')
+            return this.autoFetchPromise ? this.autoFetchPromise.raw : Promise.resolve()
+        }
         if (!this.autoFetchPromise) {
             // CAUTION createDetached(2026-H3 round6 R6-2):实例缓存的惰性结构,
             //  生命周期归实例(destroyResources)。不隔离的话,首次 fetch 发生在
@@ -38,7 +49,18 @@ export class AsyncRxSlice<T> extends RxList<T>{
         let thisReceipt = ++this.fetchReceipt
         this.isLoading(true)
         this.loadError(null)
-        return this.getRemoteData().then((data) => {
+        // CAUTION getRemoteData 同步抛错（参数校验、离线短路等，TS 的 `=> Promise<T[]>` 管不住）
+        //  与 reject 走同一条收尾：否则异常从 computed getter 里直接飞出，上面刚写的
+        //  isLoading(true) 再无人复位（receipt 已推进，旧请求的收尾也不认）。update() 的
+        //  try/await 早已兜住同一输入，兄弟实现点必须一致。调用仍在 getter 的同步段内，
+        //  抛错前读到的响应式参数照常建立依赖，参数变化后会重新拉取。
+        let request: Promise<T[]>
+        try {
+            request = this.getRemoteData()
+        } catch (err) {
+            request = Promise.reject(err)
+        }
+        return request.then((data) => {
             if (this.fetchReceipt !== thisReceipt) return
             this.spliceArray(0, Infinity, data)
         }).catch(err => {
@@ -50,6 +72,11 @@ export class AsyncRxSlice<T> extends RxList<T>{
         })
     }
     async update(cursor:number, length? : number, stop?: number, fetchBeforeCursor?: boolean, replace?: boolean) {
+        // 已销毁实例不再发请求、不再翻动 isLoading/loadError（理由同 fetch）
+        if (!this.active) {
+            warn('updating a destroyed AsyncRxSlice is a no-op')
+            return
+        }
         const thisReceipt = ++this.fetchReceipt
         this.isLoading(true)
         this.loadError(null)

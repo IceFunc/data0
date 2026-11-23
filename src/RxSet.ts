@@ -1,4 +1,4 @@
-import {ApplyPatchType, CallbacksType, computed, Computed, destroyComputed, DirtyCallback, GetterType} from "./computed.js";
+import {ApplyPatchType, CallbacksType, computed, Computed, destroyComputed, DirtyCallback, getComputedInternal, GetterType} from "./computed.js";
 import {Atom} from "./atom.js";
 import {ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
@@ -77,6 +77,11 @@ export class RxSet<T> extends Computed {
             warn('mutating a destroyed RxSet is a no-op')
             return this
         }
+        // CAUTION -0 在写入口归一化为 +0（与原生 Set#add 一致）：容器里存的是 +0，而
+        //  triggerInfo 曾原样带着调用方的 -0——toList 等按 argv 重放的派生结构把 -0 推进
+        //  列表，与容器本身、与全量重算（[...set]）在 Object.is 下分叉（列表元素身份按
+        //  Object.is，README「RxList 参数契约」）。载荷里的成员必须就是容器里存的那个值。
+        if ((value as unknown) === 0) value = 0 as unknown as T
         if (!this.data.has(value)) {
             this.data.add(value)
             this.trigger(this, TriggerOpTypes.ADD, { key: value, newValue: value})
@@ -93,6 +98,8 @@ export class RxSet<T> extends Computed {
             warn('mutating a destroyed RxSet is a no-op')
             return this
         }
+        // -0 归一化为 +0：载荷与容器里存的值一致（理由见 add）
+        if ((value as unknown) === 0) value = 0 as unknown as T
         if (this.data.has(value)) {
             this.data.delete(value)
             this.trigger(this, TriggerOpTypes.DELETE, { key: value, argv: [value]})
@@ -378,8 +385,12 @@ export class RxSet<T> extends Computed {
     }
     // CAUTION size 惰性创建（createDetached 说明见 RxMap 的同名注释）
     declare _size?: Atom<number>
+    // size 的内部 Computed：判活用（atom 本身不带 active），与 _size 同时赋值
+    declare _sizeEffect?: Computed
     get size(): Atom<number> {
-        if (this._size) return this._size
+        // CAUTION 缓存只在它还活着时复用（规则与理由见 RxMap.keys 的同款说明）：使用方
+        //  destroyComputed(set.size) 之后，宿主还活着就重建，否则所有读者永久读到旧 size。
+        if (this._size && (this._sizeEffect!.active || !this.active)) return this._size
         this._size = ReactiveEffect.createDetached(() => {
             const source = this
             return computed(
@@ -392,6 +403,7 @@ export class RxSet<T> extends Computed {
                 }
             )
         })
+        this._sizeEffect = getComputedInternal(this._size)!
         // 已销毁结构的 meta 首读:快照值保留,立即随葬(等价类说明见 RxList.length)
         if (!this.active) destroyComputed(this._size)
         return this._size

@@ -5,6 +5,7 @@ import {
     Computed,
     destroyComputed,
     DirtyCallback,
+    getComputedInternal,
     GetterType,
     setComputedRetainedDiagnosticSource,
     STATUS_CLEAN
@@ -145,6 +146,10 @@ function normalizeIndexKey(key: unknown): unknown {
 const TOSORTED_BULK_MIN = 64
 const TOSORTED_BULK_RATIO = 4
 const TOSORTED_BULK_CAP = 4096
+
+// toSet 批量删除阈值：单次 splice 删除项达到该数量时改走单遍路径（理由与标定见
+// toSet applyPatch 内注释）。
+const TOSET_BULK_MIN = 128
 
 // SameValueZero(NaN 等于自身):与 Map 组键语义一致,用于 dev 稳定性比对与
 // selection atom 单选分支的判等(R6-1)。
@@ -1900,31 +1905,41 @@ export class RxList<T> extends Computed {
                 return map
             },
             function applyPatch(this: RxMap<any, T>, _data, triggerInfos) {
-                triggerInfos.forEach((triggerInfo) => {
+                // CAUTION 多 info 重放 × 重复 key 断言（守卫对称性 R8-4 的 batch 面）：一次 digest
+                //  重放多条 info 时，"先插入同 key 新行、再删除旧行"（batch 内以 insert + remove
+                //  移动一行 / 先推新版本再淘汰旧版本 / 两次 set 互换 key）会在重放中途短暂撞 key，
+                //  而终态 source 的 key 是唯一的——全量 computation 不会断言。此时断言等于把
+                //  不可观察的中间态当成违约：异常抛给 batch 调用方，派生 Map 停在旧值直到下一次
+                //  源变更（README §3「batch 退出后 ≡ 终态全量重算」）。撞 key 且 info 不止一条时
+                //  回退全量重算：终态确有重复 key 时由 computation 以同一条消息断言；单 info
+                //  （非 batch）下重复 key 就是可观察的违约，保持当场断言。
+                const multi = triggerInfos.length > 1
+                for (const triggerInfo of triggerInfos) {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
-                        deleteItems.forEach((item) => {
-                            if (item == null) return // 稀疏洞/null 行:无 entry 可删
+                        for (const item of deleteItems) {
+                            if (item == null) continue // 稀疏洞/null 行:无 entry 可删
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
                             this.delete(indexKey)
-                        })
+                        }
                         const newItemsInArgs = argv!.slice(2)
-                        newItemsInArgs.forEach((item) => {
+                        for (const item of newItemsInArgs) {
                             // CAUTION 与全量 computation 的 null/undefined 行跳过语义对称：
                             //  插入侧漏守卫时 push(null) 的属性读直接 TypeError 抛给
                             //  变更调用方（2026-H3 round4 动态复现，与删除侧守卫同一等价类）。
-                            if (item == null) return
+                            if (item == null) continue
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
 
+                            if (multi && this.data.has(indexKey)) return false
                             assert(!this.data.has(indexKey), 'indexBy key is already exist')
                             this.set(indexKey, item)
-                        })
+                        }
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         // 非稠密 key:数组属性赋值,无元素变化(幽灵 EKC 等价类,忽略 ≡ 全量)
-                        if (!isDenseIndexKey(key)) return
+                        if (!isDenseIndexKey(key)) continue
                         // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry;
                         // null 旧行与全量语义一致地视为"无 entry")
                         if (oldValue != null) {
@@ -1938,12 +1953,13 @@ export class RxList<T> extends Computed {
                             //  splice 插入侧都 assert 重复 key,EKC 插入侧曾缺——set() 撞已有
                             //  key 静默覆盖 entry,派生 Map 与全量重算永久分叉(全量侧会抛)。
                             //  凡全量侧 assert 的关系不变量,patch 每个插入入口必须同 assert。
+                            if (multi && this.data.has(newKey)) return false
                             assert(!this.data.has(newKey), 'indexBy key is already exist')
                             this.set(newKey, newValue as T)
                         }
                     }
                     // 还有可能是 reorder, reorder 对 map 来说没有影响。
-                })
+                }
             }
         )
     }
@@ -1971,7 +1987,9 @@ export class RxList<T> extends Computed {
                 return map
             },
             function applyPatch(this: RxMap<any, T>, _data, triggerInfos) {
-                triggerInfos.forEach((triggerInfo) => {
+                // 多 info 重放中途撞 key 回退全量重算（理由见 indexBy 的同款说明）
+                const multi = triggerInfos.length > 1
+                for (const triggerInfo of triggerInfos) {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
@@ -1982,19 +2000,20 @@ export class RxList<T> extends Computed {
                             this.delete(entry[0])
                         })
                         const newItemsInArgs = argv!.slice(2) as ([any, any] | undefined)[]
-                        newItemsInArgs.forEach((entry) => {
+                        for (const entry of newItemsInArgs) {
                             // CAUTION 与全量 computation 的 undefined 行跳过语义对称：
                             //  插入侧直接解构时 push(undefined) 当场 TypeError 抛给变更
                             //  调用方（2026-H3 round4 动态复现，与删除侧守卫同一等价类）。
-                            if (entry === undefined) return
+                            if (entry === undefined) continue
                             // 守卫对称性(R8-4,与 indexBy 同族):全量侧 assert 重复 key,
                             // 插入入口曾静默覆盖(entry 撞 key 后派生 Map 与全量分叉)
+                            if (multi && this.data.has(entry[0])) return false
                             assert(!this.data.has(entry[0]), 'toMap key is already exist')
                             this.set(entry[0], entry[1])
-                        })
+                        }
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         // 非稠密 key:数组属性赋值,无元素变化(幽灵 EKC 等价类,忽略 ≡ 全量)
-                        if (!isDenseIndexKey(key)) return
+                        if (!isDenseIndexKey(key)) continue
                         // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
                         if (oldValue !== undefined) {
                             this.delete((oldValue as [any, any])[0])
@@ -2003,12 +2022,13 @@ export class RxList<T> extends Computed {
                         if (newValue !== undefined) {
                             const [newKey, newItem] = newValue as [any, any]
                             // 守卫对称性(R8-4):EKC 插入入口与全量/splice 侧同 assert
+                            if (multi && this.data.has(newKey)) return false
                             assert(!this.data.has(newKey), 'toMap key is already exist')
                             this.set(newKey, newItem)
                         }
                     }
                     // 还有可能是 reorder, reorder 对 map 来说没有影响。
-                })
+                }
             }
         )
     }
@@ -2027,9 +2047,34 @@ export class RxList<T> extends Computed {
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
-                        deleteItems.forEach((item) => {
-                            if (!base.data.includes(item)) this.delete(item)
-                        })
+                        if (deleteItems.length < TOSET_BULK_MIN) {
+                            deleteItems.forEach((item) => {
+                                if (!base.data.includes(item)) this.delete(item)
+                            })
+                        } else {
+                            // CAUTION 批量删除走单遍路径（规模债务，与 groupBy/toSorted 的批量清偿
+                            //  同族）：逐项 includes 是每个删除项扫一遍源——k 项 × O(n) 源长，
+                            //  replaceData(n 行新数据)/大段 splice 是 O(n²)（n=4 万实测 ~380ms，
+                            //  而全量重算 new Set 只要 ~1ms；10 万行级走秒）。改为：先把删除项
+                            //  放进一个 Set，扫一遍源，仍在源里出现的（重复值的其他实例）从中
+                            //  划掉，剩下的才是真正消失的成员——O(k + n)。Set#has/delete 与
+                            //  Array#includes 同为 SameValueZero（NaN 可命中、0/-0 合并；稀疏洞
+                            //  两边都读作 undefined），删除顺序仍是删除项的首现顺序。
+                            //  阈值标定（n=4 万对象行实测）：一次未命中的 includes ≈ 9µs（每元素
+                            //  ~0.2ns），单遍路径 ≈ 0.85ms（每元素一次哈希查找 ~20ns），交叉点
+                            //  在 ~100 项（字符串行的 includes 更慢，交叉点更低）。阈值取 128：
+                            //  小于阈值保持原路径——单删/小段 splice 是最热形态，对它们一步不改
+                            //  （不会变慢）；达到阈值后单遍不慢于逐项扫描（源很短时两条路径都在
+                            //  微秒级，无从区分）。
+                            const gone = new Set<T>(deleteItems)
+                            const data = base.data
+                            for (let i = 0; i < data.length && gone.size > 0; i++) {
+                                gone.delete(data[i])
+                            }
+                            gone.forEach((item) => {
+                                this.delete(item)
+                            })
+                        }
                         const newItemsInArgs = argv!.slice(2)
                         newItemsInArgs.forEach((item) => {
                             this.add(item)
@@ -2050,8 +2095,13 @@ export class RxList<T> extends Computed {
     //  length computed 曾是主要的固定开销之一。惰性创建以 createDetached 包裹，
     //  解决旧注释里"在 autorun/computed 中读会被当作 children 误销毁"的问题。
     declare _length?: Atom<number>
+    // length 的内部 Computed：判活用（atom 本身不带 active），与 _length 同时赋值
+    declare _lengthEffect?: Computed
     get length(): Atom<number> {
-        if (this._length) return this._length
+        // CAUTION 缓存只在它还活着时复用（规则与理由见 RxMap.keys 的同款说明）：length 是
+        //  全体使用方共享的单例，使用方 destroyComputed(list.length) 之后，宿主还活着就重建
+        //  （否则所有读者永久读到旧长度）；宿主已销毁则继续返回同一个已销毁快照（幂等）。
+        if (this._length && (this._lengthEffect!.active || !this.active)) return this._length
         const length = ReactiveEffect.createDetached(() => {
             const source = this
             const created = computed(
@@ -2067,6 +2117,7 @@ export class RxList<T> extends Computed {
             return created
         })
         this._length = length
+        this._lengthEffect = getComputedInternal(length)!
         // CAUTION 已销毁结构的 meta 首读（2026-H3 round7）：destroyResources 只能清理
         //  当时已存在的 meta，销毁后首读会重建一个**活的** computed 订阅已销毁的
         //  source——值是正确快照（销毁后变更皆 no-op），但 effect 常驻泄漏且逃过
