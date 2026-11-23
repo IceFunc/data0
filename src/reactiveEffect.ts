@@ -135,7 +135,7 @@ export class ReactiveEffect extends ManualCleanup {
                 children.length = 0
             }
             reachedDestroyEvent = true
-            effect.dispatch('destroy')
+            ReactiveEffect.dispatchDestroy(effect)
         } catch (error) {
             // CAUTION 用户清理抛错不能让销毁停在一半：active 已经是 false，之后任何销毁入口都会
             //  跳过本 effect——没摘掉的订阅、没销毁的子 effect 就永远留下了。把剩下的步骤做完，
@@ -177,10 +177,32 @@ export class ReactiveEffect extends ManualCleanup {
             reportTeardownError(error)
         }
         try {
-            effect.dispatch('destroy')
+            ReactiveEffect.dispatchDestroy(effect)
         } catch (error) {
             reportTeardownError(error)
         }
+    }
+    // destroy 监听者是清理代码（onDestroy 回调、派生结构挂的级联销毁）：一个抛错不能让排在后面的
+    // 收不到通知——它们要释放的东西就永久留下了。全部通知完再抛出第一个错误，其余的上报。
+    // 绝大多数 effect 没有监听者，直接返回。
+    private static dispatchDestroy(effect: ReactiveEffect) {
+        const callbacks = effect._eventToCallbacks?.get('destroy')
+        if (callbacks === undefined) return
+        let failed = false
+        let first: unknown
+        callbacks.forEach(callback => {
+            try {
+                callback.call(effect)
+            } catch (error) {
+                if (failed) {
+                    reportTeardownError(error)
+                } else {
+                    failed = true
+                    first = error
+                }
+            }
+        })
+        if (failed) throw first
     }
 
     deps: Dep[] = SHARED_EMPTY_DEPS

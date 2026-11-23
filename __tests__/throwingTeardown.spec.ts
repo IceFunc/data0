@@ -518,6 +518,23 @@ describe('a cleanup that throws does not leave the teardown half done', () => {
         expect(errorLog).toEqual([])
     })
 
+    test('a destroy listener that throws does not keep the later listeners from being notified', () => {
+        const dep = atom(0)
+        const notified: string[] = []
+        const c = new Computed(() => dep(), undefined, true, {
+            onDestroy() { notified.push('callbacks.onDestroy'); throw new Error('first') },
+        })
+        c.run([], true)
+        c.on('destroy', () => { notified.push('second'); throw new Error('second') })
+        c.on('destroy', () => { notified.push('third') })
+
+        expect(() => c.destroy()).toThrow('first')
+        expect(notified).toEqual(['callbacks.onDestroy', 'second', 'third'])
+        expect(subscribers(dep)).toEqual([])
+        expect(errorLog).toHaveLength(1)
+        expect((errorLog[0][1] as Error).message).toBe('second')
+    })
+
     test('explicit destroy inside another effect: tracking is restored and that effect is not subscribed', () => {
         const dep = atom(0)
         const read = atom(0)
