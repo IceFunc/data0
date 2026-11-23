@@ -150,7 +150,7 @@ export const CORE_INVENTORY: Record<string, Row> = {
         'deepReview2026H3Round7.spec.ts(async 调度路径钩子抛错 console 兜底后自愈)'),
     'reactiveEffect.children': row(
         'computed.spec.ts(inner destroy/惰性集合)+common.spec.ts(uncontrolled child)',
-        'reduceOperator.spec.ts+rxList.spec.ts(行级 effect 回收,间接)',
+        'reduceOperator.spec.ts+rxList.spec.ts(行级 effect 回收,间接)+throwingTeardown.spec.ts(父重算时子清理抛错:宿主 × 顶层/嵌套,栈复原+依赖保留+恢复)',
         'lifecycleAndReplayFixes.spec.ts(统一资源清理链)+reproducedIssuesFixes.spec.ts(F9 孤儿 child)+teardownTracking.spec.ts(父重算销毁子 effect 时的追踪/收集隔离)',
         'NA:同步构造',
         'coreLedgerBurndown.spec.ts(batch 内宿主重算一次,子销毁重建恰一次)',

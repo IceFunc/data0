@@ -408,7 +408,14 @@ export class Computed extends ReactiveEffect {
             this._asyncGetterWarned = true
             warn('async getter can only track reactive data before first await. If you want to track more data, please use generator getter.')
         }
-        this.prepareTracking(true)
+        // 与 generator getter 同一通道：销毁上一轮子 effect 时的清理抛错走 rejection，
+        // 由 fullRecompute 的错误恢复复位 asyncStatus/status 并 settle cleanPromise。
+        // 同步抛出会让状态停在 RECOMPUTING、asyncStatus 恒为 true、cleanPromise 永不结束。
+        try {
+            this.prepareTracking(true)
+        } catch (err) {
+            return Promise.reject(err)
+        }
         this.manualTracking ? notifier.pauseTracking() : notifier.enableTracking()
         try {
             return this.getter!.call(this, getterContext!)
