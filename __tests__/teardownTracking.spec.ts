@@ -998,6 +998,21 @@ describe('effects created by the teardown of a re-running effect', () => {
         uncollected!.destroy()
         parent.destroy()
     })
+
+    test('a child cleanup that destroys its parent with ignoreChildren during destroyChildren', () => {
+        // destroyChildren 期间 _children 指向冻结的哨兵:ignoreChildren 分支不能去清空它
+        // (TypeError),正在进行的这一轮销毁照常把剩下的子 effect 销毁完。
+        const cleaned: string[] = []
+        const parent: Computed = new Computed(() => {
+            autorun(({onCleanup}) => { onCleanup(() => { cleaned.push('first'); parent.destroy(true) }) }, true)
+            autorun(({onCleanup}) => { onCleanup(() => { cleaned.push('second') }) }, true)
+        }, undefined, true)
+        parent.run([], true)
+        expect(() => parent.destroyChildren()).not.toThrow()
+        expect(cleaned).toEqual(['first', 'second'])
+        expect(parent.active).toBe(false)
+        expect(parent.hasChildren()).toBe(false)
+    })
 })
 
 /**

@@ -655,6 +655,8 @@ export class Computed extends ReactiveEffect {
 
     prepareRecompute() {
         this.setStatus(STATUS_RECOMPUTING)
+        // 没有钩子就没有用户代码要执行（绝大多数重算）：不付隔离的成本
+        if (this.lastCleanupFn === undefined && !this.hasListener('recompute') && !this.hasListener('cleanup')) return
         // CAUTION 本 computed 此刻还没有入栈：它在别的 effect 执行中被重算时，钩子跑在
         //  外层 effect 的帧里，读取不得被外层追踪。
         const isolated = isolateTeardown()

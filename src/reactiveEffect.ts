@@ -117,7 +117,7 @@ export class ReactiveEffect extends ManualCleanup {
             if (effect.parent !== undefined) effect.parent = undefined
             if (!ignoreChildren) {
                 effect.destroyChildren()
-            } else if (effect._children) {
+            } else if (effect._children && effect._children !== CHILDREN_IN_TEARDOWN) {
                 // CAUTION ignoreChildren 语义是"留下 children 由调用方自行管理"，
                 //  但必须断开它们的 parent 反向指针：否则这些孤儿 child 之后被单独
                 //  destroy 时，会在已清空的 siblings 数组上做 last 替换（pop 出
