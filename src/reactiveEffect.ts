@@ -93,6 +93,14 @@ export class ReactiveEffect extends ManualCleanup {
         //  被安全拦截，不会出现"销毁中重算/重复销毁"。
         effect.active = false
         trackRetainedReactiveEffectDestroyed(effect)
+        // CAUTION 快路径：没有子 effect、没有任何监听者、也没有子类资源钩子的 effect——渲染框架里
+        //  的属性 / 文本绑定几乎都是这样——销毁时不会执行任何用户代码：不需要隔离，不可能抛错，
+        //  也没有 destroy 事件要派发。摘掉订阅、离开父 effect 就结束。这是列表卸载时每个绑定都走的路径。
+        if (effect._children === undefined && effect._eventToCallbacks === undefined && effect.destroyResources === noDestroyResources) {
+            effect.cleanup()
+            ReactiveEffect.unlinkFromParent(effect, fromParent)
+            return
+        }
         // 以下三处都会执行用户清理代码：destroyResources、子 effect 的销毁、destroy 事件
         const isolated = isolateTeardown()
         let reachedDestroyEvent = false
@@ -105,22 +113,7 @@ export class ReactiveEffect extends ManualCleanup {
             effect.destroyResources()
             effect.cleanup()
 
-            // 如果不是 fromParent，就要从父亲中移除。如果是，父亲会自己清空 children
-            if (effect.parent && !fromParent) {
-                // 要把自己从 parent.children 中移除掉。直接用 last 替换掉当前的要上出的，提升删除速度。
-                const siblings = effect.parent._children
-                // CAUTION length 守卫：防御 siblings 已被外部清空时 pop 出 undefined
-                if (siblings && siblings.length) {
-                    const last = siblings.pop()!
-                    if (last !== effect) {
-                        siblings[effect.index!] = last
-                        last.index = effect.index
-                    }
-                }
-            }
-
-            // CAUTION 赋值 undefined 而不是 delete：delete 会把对象推进字典属性模式
-            if (effect.parent !== undefined) effect.parent = undefined
+            ReactiveEffect.unlinkFromParent(effect, fromParent)
             if (!ignoreChildren) {
                 effect.destroyChildren()
             } else if (effect._children && effect._children !== CHILDREN_IN_TEARDOWN) {
@@ -146,23 +139,32 @@ export class ReactiveEffect extends ManualCleanup {
             if (isolated) notifier.resetTracking()
         }
     }
-    // 销毁中途用户清理抛错后的慢路径：把上面没做完的步骤做完。与正常路径同序，每一步都幂等
-    // （cleanup 以 deps.length 为准，断父链以 parent 为准，destroyChildren 抛错前已把所有
-    // 子 effect 销毁完），所以不需要知道是哪一步抛的错。正常路径保持内联，不为这里付调用成本。
-    private static finishDestroyAfterError(effect: ReactiveEffect, fromParent: boolean, ignoreChildren: boolean) {
-        effect.cleanup()
+    // 离开父 effect。幂等：以 parent 为准，做过一次之后再调用什么都不做。
+    private static unlinkFromParent(effect: ReactiveEffect, fromParent: boolean) {
         const parent = effect.parent
-        if (parent !== undefined) {
+        if (parent === undefined) return
+        // 如果不是 fromParent，就要从父亲中移除。如果是，父亲会自己清空 children
+        if (!fromParent) {
+            // 要把自己从 parent.children 中移除掉。直接用 last 替换掉当前的要上出的，提升删除速度。
             const siblings = parent._children
-            if (!fromParent && siblings && siblings.length) {
+            // CAUTION length 守卫：防御 siblings 已被外部清空时 pop 出 undefined
+            if (siblings && siblings.length) {
                 const last = siblings.pop()!
                 if (last !== effect) {
                     siblings[effect.index!] = last
                     last.index = effect.index
                 }
             }
-            effect.parent = undefined
         }
+        // CAUTION 赋值 undefined 而不是 delete：delete 会把对象推进字典属性模式
+        effect.parent = undefined
+    }
+    // 销毁中途用户清理抛错后的慢路径：把上面没做完的步骤做完。与正常路径同序，每一步都幂等
+    // （cleanup 以 deps.length 为准，断父链以 parent 为准，destroyChildren 抛错前已把所有
+    // 子 effect 销毁完），所以不需要知道是哪一步抛的错。正常路径保持内联，不为这里付调用成本。
+    private static finishDestroyAfterError(effect: ReactiveEffect, fromParent: boolean, ignoreChildren: boolean) {
+        effect.cleanup()
+        ReactiveEffect.unlinkFromParent(effect, fromParent)
         try {
             if (!ignoreChildren) {
                 effect.destroyChildren()
@@ -660,6 +662,8 @@ export class ReactiveEffect extends ManualCleanup {
 }
 
 // 恒定默认值放在原型上：实例只在真正改写时才产生自有属性（见类顶部 declare 说明）
+// 基类的空钩子：销毁快路径用它判断「这个 effect 没有子类资源要释放」
+const noDestroyResources = ReactiveEffect.prototype.destroyResources
 ReactiveEffect.prototype.isRunningAsync = false
 ReactiveEffect.prototype._pendingDestroy = 0
 ReactiveEffect.prototype.useDepMarker = true

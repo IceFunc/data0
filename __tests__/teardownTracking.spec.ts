@@ -1177,3 +1177,106 @@ describe('differential fuzz: tracked reads in teardown ≡ raw reads', () => {
         expect(cleanups).toBeGreaterThan(500)
     })
 })
+
+/**
+ * 销毁快路径:没有子 effect、没有监听者、没有子类资源钩子的 effect 销毁时不会执行用户代码,
+ * 静态 destroy 直接摘订阅、离开父 effect。下面钉住两件事:快路径做的事和完整路径一样;
+ * 只要三个条件有一个不成立,就走完整路径(子 effect 被销毁、监听者被通知、资源钩子被执行)。
+ */
+describe('destroy fast path for effects that cannot run user code', () => {
+    test('a plain effect destroyed on its own is unsubscribed and leaves its parent', () => {
+        const dep = atom(0)
+        const tick = atom(0)
+        let plain!: LightEffect
+        let plainRuns = 0
+        let siblingCleanups = 0
+        const parent = new Computed(() => {
+            dep()
+            plain = new LightEffect(() => { tick(); plainRuns++ })
+            autorun(({onCleanup}) => { onCleanup(() => { siblingCleanups++ }) }, true)
+        }, undefined, true)
+        parent.run([], true)
+        expect(parent.children.length).toBe(2)
+        expect(subscribers(tick)).toEqual([plain])
+
+        plain.destroy()
+        expect(plain.active).toBe(false)
+        expect(plain.parent).toBeUndefined()
+        expect(parent.children.length).toBe(1)
+        expect(subscribers(tick)).toEqual([])
+        tick(1)
+        expect(plainRuns).toBe(1)
+        // 幂等
+        plain.destroy()
+        expect(parent.children.length).toBe(1)
+        // 父 effect 的记账没被弄乱:重算只清理还活着的兄弟
+        dep(1)
+        expect(siblingCleanups).toBe(1)
+        parent.destroy()
+    })
+
+    test('a plain child is destroyed with its parent', () => {
+        const tick = atom(0)
+        let runs = 0
+        const stop = autorun(() => { new LightEffect(() => { tick(); runs++ }) }, true)
+        expect(subscribers(tick)).toHaveLength(1)
+        stop()
+        expect(subscribers(tick)).toEqual([])
+        tick(1)
+        expect(runs).toBe(1)
+    })
+
+    test('with a child effect: the child is destroyed', () => {
+        const tick = atom(0)
+        let childRuns = 0
+        const host = new LightEffect(() => { new LightEffect(() => { tick(); childRuns++ }) })
+        expect(host.hasChildren()).toBe(true)
+        host.destroy()
+        expect(subscribers(tick)).toEqual([])
+        tick(1)
+        expect(childRuns).toBe(1)
+    })
+
+    test('with a destroy listener: the listener is notified', () => {
+        const dep = atom(0)
+        const e = new LightEffect(() => { dep() })
+        let notified = 0
+        e.on('destroy', () => { notified++ })
+        e.destroy()
+        expect(notified).toBe(1)
+        expect(subscribers(dep)).toEqual([])
+    })
+
+    test('with a listener for another event only: destroy still completes', () => {
+        const dep = atom(0)
+        const e = new LightEffect(() => { dep() })
+        e.on('custom', () => {})
+        e.destroy()
+        expect(e.active).toBe(false)
+        expect(subscribers(dep)).toEqual([])
+    })
+
+    test('with a subclass resource hook: the hook runs, and its reads are isolated', () => {
+        const read = atom(0)
+        const go = atom(0)
+        let released = 0
+        class WithResource extends LightEffect {
+            destroyResources() {
+                released++
+                read()
+            }
+        }
+        const e = new WithResource(() => {})
+        let outerRuns = 0
+        const stop = autorun(() => {
+            outerRuns++
+            if (go()) e.destroy()
+        }, true)
+        go(1)
+        expect(released).toBe(1)
+        expect(subscribers(read)).toEqual([])
+        read(1)
+        expect(outerRuns).toBe(2)
+        stop()
+    })
+})
