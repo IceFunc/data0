@@ -1,4 +1,4 @@
-import {Dep, finalizeDepMarkers, initDepMarkers, pruneEmptyDepFromHost, retainDepMarkers} from "./dep.js";
+import {Dep, finalizeDepMarkers, initDepMarkers, pruneEmptyDepFromHost, restoreEffectDeps, retainDepMarkers} from "./dep.js";
 import {maxMarkerBits, Notifier, notifier} from "./notify.js";
 import type {InputTriggerInfo, TriggerInfo} from "./notify.js";
 import type {TriggerOpTypes} from "./operations.js";
@@ -48,6 +48,11 @@ export function isolateTeardown(): boolean {
     return true
 }
 
+// 销毁收尾中、第一个错误之后再出现的错误：第一个错误会抛给调用方，这些只能上报。
+function reportTeardownError(error: unknown) {
+    console.error('[data0] uncaught error in teardown:', error)
+}
+
 export class ReactiveEffect extends ManualCleanup {
     static activeScopes: ReactiveEffect[] = []
     public active: boolean
@@ -90,6 +95,7 @@ export class ReactiveEffect extends ManualCleanup {
         trackRetainedReactiveEffectDestroyed(effect)
         // 以下三处都会执行用户清理代码：destroyResources、子 effect 的销毁、destroy 事件
         const isolated = isolateTeardown()
+        let reachedDestroyEvent = false
         try {
             // CAUTION 子类资源清理钩子（惰性 meta、lastCleanupFn、cleanPromise、行级
             //  effect frame 等）。所有销毁入口——实例 destroy()、destroyChildren、
@@ -128,9 +134,52 @@ export class ReactiveEffect extends ManualCleanup {
                 }
                 children.length = 0
             }
+            reachedDestroyEvent = true
             effect.dispatch('destroy')
+        } catch (error) {
+            // CAUTION 用户清理抛错不能让销毁停在一半：active 已经是 false，之后任何销毁入口都会
+            //  跳过本 effect——没摘掉的订阅、没销毁的子 effect 就永远留下了。把剩下的步骤做完，
+            //  再把第一个错误抛给调用方；收尾中再出的错误只上报。
+            if (!reachedDestroyEvent) ReactiveEffect.finishDestroyAfterError(effect, fromParent, ignoreChildren)
+            throw error
         } finally {
             if (isolated) notifier.resetTracking()
+        }
+    }
+    // 销毁中途用户清理抛错后的慢路径：把上面没做完的步骤做完。与正常路径同序，每一步都幂等
+    // （cleanup 以 deps.length 为准，断父链以 parent 为准，destroyChildren 抛错前已把所有
+    // 子 effect 销毁完），所以不需要知道是哪一步抛的错。正常路径保持内联，不为这里付调用成本。
+    private static finishDestroyAfterError(effect: ReactiveEffect, fromParent: boolean, ignoreChildren: boolean) {
+        effect.cleanup()
+        const parent = effect.parent
+        if (parent !== undefined) {
+            const siblings = parent._children
+            if (!fromParent && siblings && siblings.length) {
+                const last = siblings.pop()!
+                if (last !== effect) {
+                    siblings[effect.index!] = last
+                    last.index = effect.index
+                }
+            }
+            effect.parent = undefined
+        }
+        try {
+            if (!ignoreChildren) {
+                effect.destroyChildren()
+            } else if (effect._children && effect._children !== CHILDREN_IN_TEARDOWN) {
+                const children = effect._children
+                for (let i = 0; i < children.length; i++) {
+                    if (children[i].parent === effect) children[i].parent = undefined
+                }
+                children.length = 0
+            }
+        } catch (error) {
+            reportTeardownError(error)
+        }
+        try {
+            effect.dispatch('destroy')
+        } catch (error) {
+            reportTeardownError(error)
         }
     }
 
@@ -232,20 +281,31 @@ export class ReactiveEffect extends ManualCleanup {
             //     却留着 parent 与这一代数组的 index——之后单独 destroy 时按陈旧 index
             //     在新 children 上做 swap-pop，删掉无关的兄弟（兄弟从此不随宿主重算
             //     销毁）。生命周期不变：此前同样不会被本 effect 销毁。
-            //  抛错时还原 children：尚未销毁的子 effect 由下一次 destroyChildren 处理。
+            //  3. 一个子 effect 的清理抛错，不能让它后面的兄弟留下：这可能是最后一次销毁
+            //     （本 effect 自己正在被销毁），不会再有下一轮来收拾。把剩下的销毁完，
+            //     再抛出第一个错误；其余的错误只上报。
             this._children = CHILDREN_IN_TEARDOWN
-            let completed = false
             const isolated = isolateTeardown()
+            let i = 0
             try {
-                children.forEach(child => {
+                for (; i < children.length; i++) {
                     // CAUTION 走实例方法（fromParent=true）：destroy 可能被子类覆写，
                     //  静态调用会绕过覆写与 destroyResources 钩子链。
-                    child.destroy(false, true)
-                })
-                completed = true
+                    //  ?.：数组可能有空洞（历史上按陈旧 index 做 swap-pop 留下的）。
+                    children[i]?.destroy(false, true)
+                }
+            } catch (error) {
+                for (i++; i < children.length; i++) {
+                    try {
+                        children[i]?.destroy(false, true)
+                    } catch (laterError) {
+                        reportTeardownError(laterError)
+                    }
+                }
+                throw error
             } finally {
                 if (isolated) notifier.resetTracking()
-                this._children = completed ? undefined : children
+                this._children = undefined
             }
             return
         }
@@ -305,6 +365,7 @@ export class ReactiveEffect extends ManualCleanup {
     //  callSimpleGetter/callAsyncGetter 一直如此，若不撤销，宿主永久留在 activeScopes
     //  上，之后任何顶层读取都会订阅它。
     prepareTracking(isFirst = false, isAsync = this.isAsync) {
+        let previousDeps: Dep[] | undefined
         if (!isAsync) {
             Notifier.trackOpBit = 1 << ++notifier.effectTrackDepth
             ReactiveEffect.activeScopes.push(this)
@@ -312,6 +373,9 @@ export class ReactiveEffect extends ManualCleanup {
             if (this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) {
                 initDepMarkers(this)
             } else {
+                // full cleanup 模式在销毁子 effect 之前就清空依赖。有子 effect 时留一份快照：
+                // 子 effect 的清理抛错的话，下面用它恢复，否则本 effect 从此不再响应。
+                if (this._children !== undefined && this.deps.length) previousDeps = this.deps.slice()
                 this.cleanup()
             }
         } else {
@@ -331,9 +395,13 @@ export class ReactiveEffect extends ManualCleanup {
             // 复位位标记。
             // CAUTION full cleanup 模式不能标记：依赖已在上面清空，清理里读到的 atom 此刻可能已被
             //  追踪成新依赖，而该模式下 completeTracking 不做 finalize，位标记会留在 dep 上——
-            //  之后同一深度读这个 atom 的 effect 会被判为已订阅而静默漏订阅。该模式的依赖由
-            //  调用方的错误恢复处理（Computed 的 restoreEffectDeps）。
-            if (!isAsync && this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) retainDepMarkers(this)
+            //  之后同一深度读这个 atom 的 effect 会被判为已订阅而静默漏订阅。该模式用上面的
+            //  快照恢复依赖（Computed 的错误恢复随后还会 restoreEffectDeps 一次，结果相同）。
+            if (!isAsync && this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) {
+                retainDepMarkers(this)
+            } else if (previousDeps !== undefined) {
+                restoreEffectDeps(this, previousDeps)
+            }
             this.completeTracking(false, isAsync)
             throw err
         }

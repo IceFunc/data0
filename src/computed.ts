@@ -57,7 +57,13 @@ export function destroyComputed(computedItem: ComputedData) {
     const internal = resolveComputedInternal(computedItem)!
     // CAUTION 走实例方法而不是静态 ReactiveEffect.destroy：子类（RxList/RxMap/RxSet）
     //  可能覆写 destroy 附加行为，绕过实例方法会跳过它们。
-    internal.destroy()
+    //  覆写里的代码先于静态核心执行，在这里一并隔离（与 destroyChildren 一致）。
+    const isolated = isolateTeardown()
+    try {
+        internal.destroy()
+    } finally {
+        if (isolated) notifier.resetTracking()
+    }
 }
 
 export function getComputedInternal(computedItem: ComputedData) {

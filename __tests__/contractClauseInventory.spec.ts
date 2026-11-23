@@ -286,6 +286,11 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
     },
     // 行使空间 = 触发清理的入口(父重算/嵌套重算/行重算/显式与延迟销毁)× 清理形态 × 正在执行的 effect 形态,
     // 外加「清理里的追踪读取 ≡ .raw 读取」差分 fuzz;对侧(清理触发/创建的 effect 照常追踪)同文件钉扎。
+    'C6.11 清理抛错,销毁照常做完': {
+        section: '6.', kind: 'behavior',
+        quote: '**清理抛错,销毁照常做完**',
+        assets: ['throwingTeardown.spec.ts'],
+    },
     'C6.9 清理不建立依赖': {
         section: '6.', kind: 'grant',
         quote: '**清理不建立依赖**',

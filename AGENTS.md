@@ -124,6 +124,8 @@ Review 结论必须分为三类，不得混写：
   资产：`__tests__/destroySemantics.spec.ts`（全派生族僵尸/泄漏横扫）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy 取消在途 async patch、no-op 变更）。
 - 清理代码的读取不属于恰好正在执行的 effect：库在重算或销毁中调用用户清理的位置（静态 `ReactiveEffect.destroy`、`destroyChildren`、`prepareRecompute`、map 的行级清理）必须经 `isolateTeardown()` 隔离并在 `finally` 恢复；`destroyChildren` 期间本 effect 同时不收集子 effect，否则清理里创建的 effect 会带着上一代 children 的 index 留下来，之后销毁时 swap-pop 删错兄弟。新增这类位置时同规则处理，并在矩阵里加入口。
   资产：`__tests__/teardownTracking.spec.ts`（入口 × 清理形态 × 宿主矩阵 + 「清理里的追踪读取 ≡ .raw 读取」差分 fuzz）。
+- 销毁必须做完:静态 `ReactiveEffect.destroy` 先置 `active = false` 再执行用户清理,之后任何销毁入口都会跳过它——清理抛错若中断收尾,没摘的订阅和没销毁的子 effect 就永久残留。销毁核心与 `destroyChildren` 在用户代码抛错后必须把剩余步骤做完(摘订阅、断父链、销毁子 effect 与其后的兄弟、派发 `destroy`),第一个错误抛给调用方,其余走 `console.error`;`prepareTracking` 失败时撤销自己(出栈、深度与标记位复原、依赖保留)。新增会执行用户清理的销毁步骤时同规则处理。
+  资产:`__tests__/throwingTeardown.spec.ts`(宿主形态 × 顶层/嵌套的抛错矩阵 + 半销毁残留、兄弟销毁、错误先后与 full cleanup 依赖恢复)。
 - async patch/getter 的并发行为必须经交错枚举验证，不允许只测"启动→等待→断言终值"的单一顺序；destroy 与在途 async patch 的交错也在此列。
   资产：`__tests__/asyncPatchInterleavings.spec.ts`（两个 async patch + 中途写入的全排列）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy × 挂起 patch）。
 - 涉及 axii/axle 的 `triggerInfo.argv` 原始参数契约时，不得直接修改外部协议；内部消费者应独立归一化。

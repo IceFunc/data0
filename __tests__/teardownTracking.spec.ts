@@ -516,6 +516,40 @@ describe('entry 3: destroying inside another running effect', () => {
     })
 })
 
+describe('entry 3b: a destroy() override reached through destroyComputed', () => {
+    // destroy() 覆写里的代码先于静态核心执行。经 destroyChildren 销毁时已被隔离,
+    // 经 destroyComputed 显式销毁时同样不能订阅正在执行的 effect。
+    for (const [outerName, createOuter] of Object.entries({
+        'autorun': (body: () => void) => autorun(body, true),
+        'computed': (body: () => void) => { const c = computed(body); return () => destroyComputed(c) },
+    })) {
+        test(outerName, () => {
+            const read = atom(0)
+            const go = atom(0)
+            let probes = 0
+            class Resource extends Computed {
+                destroy(ignoreChildren = false, fromParent = false) {
+                    probes++
+                    read()
+                    super.destroy(ignoreChildren, fromParent)
+                }
+            }
+            const resource = new Resource(() => 1)
+            let outerRuns = 0
+            const stop = createOuter(() => {
+                outerRuns++
+                if (go()) destroyComputed(resource)
+            })
+            go(1)
+            expect(probes).toBe(1)
+            expect(subscribers(read)).toEqual([])
+            read(1)
+            expect(outerRuns).toBe(2)
+            stop()
+        })
+    }
+})
+
 describe('entry 4: re-running a map row', () => {
     test('the row context.onCleanup of its last run does not subscribe the row', () => {
         const dep = atom(0)
@@ -931,25 +965,21 @@ describe('effects created by the teardown of a re-running effect', () => {
         parent.destroy()
     })
 
-    test('children left by a throwing cleanup are destroyed by the next re-run', () => {
+    test('children after a throwing cleanup are destroyed in the same round', () => {
         const tick = atom(0)
         let phase = 0
-        let shouldThrow = true
         let secondRuns = 0
         const parent = new LightEffect(() => {
             if (phase !== 0) return
-            autorun(({onCleanup}) => { onCleanup(() => { if (shouldThrow) throw new Error('teardown') }) }, true)
+            autorun(({onCleanup}) => { onCleanup(() => { throw new Error('teardown') }) }, true)
             autorun(() => { tick(); secondRuns++ }, true)
         })
         phase = 1
         expect(() => parent.run()).toThrow('teardown')
-        tick(1)
-        expect(secondRuns).toBe(2)
-        shouldThrow = false
-        parent.run()
         expect(parent.hasChildren()).toBe(false)
-        tick(2)
-        expect(secondRuns).toBe(2)
+        tick(1)
+        expect(secondRuns).toBe(1)
+        expect(subscribers(tick)).toEqual([])
         parent.destroy()
     })
 

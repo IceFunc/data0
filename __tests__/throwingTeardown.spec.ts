@@ -141,7 +141,7 @@ describe('a child cleanup that throws while its parent re-runs', () => {
             const control = {throws: false, runs: 0, childRuns: 0}
             const host = create(dep, () => {
                 control.runs++
-                // 抛错的子 effect 在前,正常的在后:后者必须由恢复后的重算销毁
+                // 抛错的子 effect 在前,正常的在后:后者照常销毁
                 autorun(({onCleanup}) => { onCleanup(() => { if (control.throws) throw new Error('child cleanup') }) }, true)
                 autorun(() => { tick(); control.childRuns++ }, true)
             })
@@ -390,5 +390,228 @@ describe('a child cleanup that throws while its parent re-runs', () => {
         dep(2)
         expect(effect.runs).toBe(2)
         effect.destroy()
+    })
+})
+
+/**
+ * 清理抛错时销毁照常做完。
+ *
+ * 静态 destroy 先把 effect 置为 inactive 再执行用户清理。清理抛错若就此中断:它的订阅没摘、
+ * 子 effect 没销毁、destroy 事件没派发,而之后任何销毁入口都会因为 inactive 跳过它——永久残留。
+ * destroyChildren 同理:一个子 effect 抛错,后面的兄弟不能留下(宿主自己正在被销毁时没有下一轮)。
+ * 第一个错误抛给调用方,收尾中再出的错误走 console.error。
+ */
+describe('a cleanup that throws does not leave the teardown half done', () => {
+    test('the subtree of the child whose cleanup threw is destroyed', () => {
+        const dep = atom(0)
+        const tick = atom(0)
+        let shouldThrow = false
+        let grandRuns = 0
+        const stop = autorun(() => {
+            dep()
+            autorun(({onCleanup}) => {
+                onCleanup(() => { if (shouldThrow) throw new Error('child cleanup') })
+                autorun(() => { tick(); grandRuns++ }, true)
+            }, true)
+        }, true)
+        shouldThrow = true
+        expect(() => dep(1)).toThrow('child cleanup')
+        shouldThrow = false
+        // 上一轮的孙 effect 已随抛错的子 effect 销毁;宿主保留依赖,下一次触发恢复
+        expect(subscribers(tick)).toEqual([])
+        dep(2)
+        expect(subscribers(tick)).toHaveLength(1)
+        stop()
+        expect(subscribers(tick)).toEqual([])
+        const before = grandRuns
+        tick(1)
+        expect(grandRuns).toBe(before)
+    })
+
+    test('the effect whose own cleanup threw is unsubscribed, loses its children and reports destroy', () => {
+        const dep = atom(0)
+        const tick = atom(0)
+        let childRuns = 0
+        let destroyed = 0
+        const c = new Computed(function (this: Computed, {onCleanup}: any) {
+            onCleanup(() => { throw new Error('own cleanup') })
+            autorun(() => { tick(); childRuns++ }, true)
+            return dep()
+        }, undefined, true)
+        c.run([], true)
+        c.on('destroy', () => { destroyed++ })
+        expect(subscribers(dep)).toHaveLength(1)
+
+        expect(() => c.destroy()).toThrow('own cleanup')
+        expect(c.active).toBe(false)
+        expect(subscribers(dep)).toEqual([])
+        expect(subscribers(tick)).toEqual([])
+        expect(c.hasChildren()).toBe(false)
+        expect(destroyed).toBe(1)
+        tick(1)
+        expect(childRuns).toBe(1)
+        // 幂等:再销毁一次什么都不做
+        expect(() => c.destroy()).not.toThrow()
+        expect(destroyed).toBe(1)
+    })
+
+    test('a child destroyed on its own whose cleanup throws still leaves its parent', () => {
+        let child!: Computed
+        let siblingCleanups = 0
+        let shouldThrow = true
+        const dep = atom(0)
+        const parent = new Computed(() => {
+            dep()
+            child = new Computed(({onCleanup}: any) => { onCleanup(() => { if (shouldThrow) throw new Error('own cleanup') }); return 1 }, undefined, true)
+            child.run([], true)
+            autorun(({onCleanup}) => { onCleanup(() => { siblingCleanups++ }) }, true)
+        }, undefined, true)
+        parent.run([], true)
+        expect(parent.children.length).toBe(2)
+
+        expect(() => child.destroy()).toThrow('own cleanup')
+        shouldThrow = false
+        expect(child.parent).toBeUndefined()
+        expect(parent.children.length).toBe(1)
+        // 父 effect 的记账没被留下的条目弄乱:重算只清理还活着的那个兄弟
+        dep(1)
+        expect(siblingCleanups).toBe(1)
+        parent.destroy()
+    })
+
+    test('destroying a parent: the siblings after a throwing child are destroyed, the first error is thrown', () => {
+        const tick = atom(0)
+        const cleaned: string[] = []
+        const runs: Record<string, number> = {b: 0, c: 0}
+        const stop = autorun(() => {
+            autorun(({onCleanup}) => { onCleanup(() => { cleaned.push('a'); throw new Error('first') }) }, true)
+            autorun(({onCleanup}) => { tick(); runs.b++; onCleanup(() => { cleaned.push('b'); throw new Error('second') }) }, true)
+            autorun(({onCleanup}) => { tick(); runs.c++; onCleanup(() => { cleaned.push('c') }) }, true)
+        }, true)
+        expect(subscribers(tick)).toHaveLength(2)
+
+        expect(() => stop()).toThrow('first')
+        expect(cleaned).toEqual(['a', 'b', 'c'])
+        expect(subscribers(tick)).toEqual([])
+        // 第二个错误不覆盖第一个,走 console.error
+        expect(errorLog).toHaveLength(1)
+        expect(String(errorLog[0][0])).toContain('teardown')
+        expect((errorLog[0][1] as Error).message).toBe('second')
+        tick(1)
+        expect(runs).toEqual({b: 1, c: 1})
+    })
+
+    test('a destroy listener that throws after the teardown: nothing is run twice', () => {
+        const dep = atom(0)
+        let cleanups = 0
+        let events = 0
+        const c = new Computed(function (this: Computed, {onCleanup}: any) {
+            onCleanup(() => { cleanups++ })
+            return dep()
+        }, undefined, true)
+        c.run([], true)
+        c.on('destroy', () => { events++; throw new Error('listener') })
+        expect(() => c.destroy()).toThrow('listener')
+        expect(cleanups).toBe(1)
+        expect(events).toBe(1)
+        expect(subscribers(dep)).toEqual([])
+        expect(errorLog).toEqual([])
+    })
+
+    test('explicit destroy inside another effect: tracking is restored and that effect is not subscribed', () => {
+        const dep = atom(0)
+        const read = atom(0)
+        const go = atom(0)
+        const c = computed(({onCleanup}) => { onCleanup(() => { read(); throw new Error('own cleanup') }); return dep() })
+        c()
+        let outerRuns = 0
+        let caught: unknown
+        const stop = autorun(() => {
+            outerRuns++
+            if (go()) {
+                try { destroyComputed(c) } catch (e) { caught = e }
+            }
+        }, true)
+        go(1)
+        expect((caught as Error).message).toBe('own cleanup')
+        expect(subscribers(dep)).toEqual([])
+        expect(subscribers(read)).toEqual([])
+        read(1)
+        expect(outerRuns).toBe(2)
+        stop()
+    })
+})
+
+describe('a bare effect in full cleanup mode keeps its dependencies', () => {
+    // full cleanup 模式在销毁子 effect 之前就清空依赖。Computed 有自己的错误恢复,
+    // 裸 effect 没有:prepareTracking 自己用快照恢复,否则它从此不再响应。
+    class FullCleanupEffect extends LightEffect {
+        constructor(fn: () => any) {
+            super(fn)
+        }
+    }
+    FullCleanupEffect.prototype.useDepMarker = false
+
+    test('useDepMarker = false', () => {
+        const dep = atom(0)
+        const other = atom(0)
+        let runs = 0
+        let shouldThrow = false
+        const e = new FullCleanupEffect(() => {
+            runs++
+            dep()
+            other()
+            autorun(({onCleanup}) => { onCleanup(() => { if (shouldThrow) throw new Error('child cleanup') }) }, true)
+        })
+        expect(e.useDepMarker).toBe(false)
+        shouldThrow = true
+        expect(() => dep(1)).toThrow('child cleanup')
+        expect(subscribers(dep)).toEqual([e])
+        expect(subscribers(other)).toEqual([e])
+        shouldThrow = false
+        other(1)
+        expect(runs).toBe(2)
+        e.destroy()
+        expect(subscribers(dep)).toEqual([])
+    })
+
+    test('deeper than the dep markers', () => {
+        const atoms = Array.from({length: 33}, () => atom(0))
+        const stops = atoms.slice(0, -1).map((_, i) => autorun(() => {
+            const value = atoms[i]()
+            if (value) atoms[i + 1](value)
+        }, true))
+        let shouldThrow = false
+        let runs = 0
+        const e = new LightEffect(() => {
+            runs++
+            atoms[32]()
+            autorun(({onCleanup}) => { onCleanup(() => { if (shouldThrow) throw new Error('child cleanup') }) }, true)
+        })
+        shouldThrow = true
+        expect(() => atoms[0](1)).toThrow('child cleanup')
+        shouldThrow = false
+        expect(subscribers(atoms[32])).toEqual([e])
+        atoms[32](100)
+        expect(runs).toBe(2)
+        e.destroy()
+        stops.forEach(s => s())
+    })
+
+    test('a host destroyed by the throwing cleanup stays destroyed and unsubscribed', () => {
+        const dep = atom(0)
+        let runs = 0
+        let shouldThrow = false
+        const e: FullCleanupEffect = new FullCleanupEffect(() => {
+            runs++
+            dep()
+            autorun(({onCleanup}) => { onCleanup(() => { if (shouldThrow) { e.destroy(); throw new Error('child cleanup') } }) }, true)
+        })
+        shouldThrow = true
+        expect(() => dep(1)).toThrow('child cleanup')
+        expect(e.active).toBe(false)
+        expect(subscribers(dep)).toEqual([])
+        dep(2)
+        expect(runs).toBe(1)
     })
 })
