@@ -122,6 +122,8 @@ Review 结论必须分为三类，不得混写：
   资产：dev 不变量断言（`batch`/effect run 的栈深复原、digest 静止态、`RxList` 行级记账对齐——违约当场抛错，被全套测试被动执行）、`__tests__/invariantAssertions.spec.ts`（断言开火自检）。
 - destroy 语义必须对称：destroy 后不再接收更新（僵尸检查）、create+destroy 后活跃 effect 计数回到基线（泄漏检查）、源模式结构与计算模式一视同仁（destroy 事件、children、惰性 meta、`context.onCleanup`）。子类的销毁清理必须放进 `destroyResources` 钩子（唯一会被所有销毁入口——实例 `destroy()`、`destroyChildren`、`destroyComputed`——执行的位置），不得放在 `destroy()` 覆写里。已销毁结构的变更方法是 no-op。
   资产：`__tests__/destroySemantics.spec.ts`（全派生族僵尸/泄漏横扫）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy 取消在途 async patch、no-op 变更）。
+- 清理代码的读取不属于恰好正在执行的 effect：库在重算或销毁中调用用户清理的位置（静态 `ReactiveEffect.destroy`、`destroyChildren`、`prepareRecompute`、map 的行级清理）必须经 `isolateTeardown()` 隔离并在 `finally` 恢复；`destroyChildren` 期间本 effect 同时不收集子 effect，否则清理里创建的 effect 会带着上一代 children 的 index 留下来，之后销毁时 swap-pop 删错兄弟。新增这类位置时同规则处理，并在矩阵里加入口。
+  资产：`__tests__/teardownTracking.spec.ts`（入口 × 清理形态 × 宿主矩阵 + 「清理里的追踪读取 ≡ .raw 读取」差分 fuzz）。
 - async patch/getter 的并发行为必须经交错枚举验证，不允许只测"启动→等待→断言终值"的单一顺序；destroy 与在途 async patch 的交错也在此列。
   资产：`__tests__/asyncPatchInterleavings.spec.ts`（两个 async patch + 中途写入的全排列）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy × 挂起 patch）。
 - 涉及 axii/axle 的 `triggerInfo.argv` 原始参数契约时，不得直接修改外部协议；内部消费者应独立归一化。

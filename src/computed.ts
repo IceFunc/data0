@@ -2,7 +2,7 @@ import {getDebugName,} from "./debug";
 import {InputTriggerInfo, Notifier, notifier, TriggerInfo} from './notify'
 import {assert, isAsync, isAsyncGenerator, isGenerator, nextTick, warn} from "./util";
 import {Atom, atom, isAtom, isPrimitiveAtom} from "./atom";
-import {ReactiveEffect} from "./reactiveEffect.js";
+import {isolateTeardown, ReactiveEffect} from "./reactiveEffect.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {
     markRetainedReactiveEffectKind,
@@ -655,19 +655,26 @@ export class Computed extends ReactiveEffect {
 
     prepareRecompute() {
         this.setStatus(STATUS_RECOMPUTING)
-        // 可以用于清理一些用户自己的副作用。
-        // 这里用了两个名字，onCleanup 是为了和 rxList 中的 api 一致。
-        // onRecompute 可以用作 log 等其他副作用
-        this.dispatch('recompute', this.data)
-        this.dispatch('cleanup', this.data)
-        // 使用 context 注册的 cleanup
-        // CAUTION 必须先复位再调用：cleanup 只该执行一次。若本轮 getter 不再注册新的
-        //  onCleanup（条件注册的场景），复位失败会导致同一个 cleanup 在后续每轮重算
-        //  被重复调用（对连接关闭/引用计数类资源是 double-free）。
-        if (this.lastCleanupFn) {
-            const cleanup = this.lastCleanupFn
-            this.lastCleanupFn = undefined
-            cleanup()
+        // CAUTION 本 computed 此刻还没有入栈：它在别的 effect 执行中被重算时，钩子跑在
+        //  外层 effect 的帧里，读取不得被外层追踪。
+        const isolated = isolateTeardown()
+        try {
+            // 可以用于清理一些用户自己的副作用。
+            // 这里用了两个名字，onCleanup 是为了和 rxList 中的 api 一致。
+            // onRecompute 可以用作 log 等其他副作用
+            this.dispatch('recompute', this.data)
+            this.dispatch('cleanup', this.data)
+            // 使用 context 注册的 cleanup
+            // CAUTION 必须先复位再调用：cleanup 只该执行一次。若本轮 getter 不再注册新的
+            //  onCleanup（条件注册的场景），复位失败会导致同一个 cleanup 在后续每轮重算
+            //  被重复调用（对连接关闭/引用计数类资源是 double-free）。
+            if (this.lastCleanupFn) {
+                const cleanup = this.lastCleanupFn
+                this.lastCleanupFn = undefined
+                cleanup()
+            }
+        } finally {
+            if (isolated) notifier.resetTracking()
         }
     }
 

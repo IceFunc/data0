@@ -24,6 +24,30 @@ import {
 //  直接 push 时立刻抛错（ESM 严格模式），而不是静默地跨 effect 污染订阅。
 const SHARED_EMPTY_DEPS: Dep[] = Object.freeze([]) as unknown as Dep[]
 
+// CAUTION "正在销毁上一轮 children"的哨兵：destroyChildren 执行期间 effect._children 指向它
+//  （见该方法说明）。用既有字段的值而不是新增实例字段表达，effect 的 hidden class 不变；
+//  freeze 保证绕过构造器守卫的直接 push 立刻抛错。
+const CHILDREN_IN_TEARDOWN: ReactiveEffect[] = Object.freeze([]) as unknown as ReactiveEffect[]
+
+/**
+ * @internal
+ * 清理隔离原语：库在重算或销毁中调用用户清理前使用，返回 true 时调用方必须在 finally 里
+ * `notifier.resetTracking()`。
+ *
+ * CAUTION 不变量：清理代码的读取不属于任何 effect。清理跑在「恰好正在执行的 effect」的
+ *  帧里——父 effect 重算销毁子 effect、computed 在别的 effect 执行中被重算、effect 执行中
+ *  显式 stop/destroy——那个 effect 若追踪了清理里的读取，之后写那个 atom 就会重跑它。
+ *  暂停追踪而不是改动 activeScopes：栈顶抑制自触发的语义不变；清理触发或创建的 effect
+ *  在自己的 run 里 enableTracking，照常收集依赖。
+ *  没有正在执行的 effect、或追踪已经暂停时没有可隔离的对象，不付开关成本。
+ *  行为执法见 __tests__/teardownTracking.spec.ts。
+ */
+export function isolateTeardown(): boolean {
+    if (!notifier.shouldTrack || ReactiveEffect.activeScopes.length === 0) return false
+    notifier.pauseTracking()
+    return true
+}
+
 export class ReactiveEffect extends ManualCleanup {
     static activeScopes: ReactiveEffect[] = []
     public active: boolean
@@ -64,44 +88,50 @@ export class ReactiveEffect extends ManualCleanup {
         //  被安全拦截，不会出现"销毁中重算/重复销毁"。
         effect.active = false
         trackRetainedReactiveEffectDestroyed(effect)
-        // CAUTION 子类资源清理钩子（惰性 meta、lastCleanupFn、cleanPromise、行级
-        //  effect frame 等）。所有销毁入口——实例 destroy()、destroyChildren、
-        //  destroyComputed——都汇聚到本静态核心，钩子恰好执行一次。旧实现把这些
-        //  清理放在各子类的 destroy() 覆写里，destroyChildren/destroyComputed 走
-        //  静态函数时全部被绕过（子 computed 的 onCleanup 从不执行、惰性 meta 泄漏）。
-        effect.destroyResources()
-        effect.cleanup()
+        // 以下三处都会执行用户清理代码：destroyResources、子 effect 的销毁、destroy 事件
+        const isolated = isolateTeardown()
+        try {
+            // CAUTION 子类资源清理钩子（惰性 meta、lastCleanupFn、cleanPromise、行级
+            //  effect frame 等）。所有销毁入口——实例 destroy()、destroyChildren、
+            //  destroyComputed——都汇聚到本静态核心，钩子恰好执行一次。旧实现把这些
+            //  清理放在各子类的 destroy() 覆写里，destroyChildren/destroyComputed 走
+            //  静态函数时全部被绕过（子 computed 的 onCleanup 从不执行、惰性 meta 泄漏）。
+            effect.destroyResources()
+            effect.cleanup()
 
-        // 如果不是 fromParent，就要从父亲中移除。如果是，父亲会自己清空 children
-        if (effect.parent && !fromParent) {
-            // 要把自己从 parent.children 中移除掉。直接用 last 替换掉当前的要上出的，提升删除速度。
-            const siblings = effect.parent._children
-            // CAUTION length 守卫：防御 siblings 已被外部清空时 pop 出 undefined
-            if (siblings && siblings.length) {
-                const last = siblings.pop()!
-                if (last !== effect) {
-                    siblings[effect.index!] = last
-                    last.index = effect.index
+            // 如果不是 fromParent，就要从父亲中移除。如果是，父亲会自己清空 children
+            if (effect.parent && !fromParent) {
+                // 要把自己从 parent.children 中移除掉。直接用 last 替换掉当前的要上出的，提升删除速度。
+                const siblings = effect.parent._children
+                // CAUTION length 守卫：防御 siblings 已被外部清空时 pop 出 undefined
+                if (siblings && siblings.length) {
+                    const last = siblings.pop()!
+                    if (last !== effect) {
+                        siblings[effect.index!] = last
+                        last.index = effect.index
+                    }
                 }
             }
-        }
 
-        // CAUTION 赋值 undefined 而不是 delete：delete 会把对象推进字典属性模式
-        if (effect.parent !== undefined) effect.parent = undefined
-        if (!ignoreChildren) {
-            effect.destroyChildren()
-        } else if (effect._children) {
-            // CAUTION ignoreChildren 语义是"留下 children 由调用方自行管理"，
-            //  但必须断开它们的 parent 反向指针：否则这些孤儿 child 之后被单独
-            //  destroy 时，会在已清空的 siblings 数组上做 last 替换（pop 出
-            //  undefined 后写 last.index 直接 TypeError）。
-            const children = effect._children
-            for (let i = 0; i < children.length; i++) {
-                if (children[i].parent === effect) children[i].parent = undefined
+            // CAUTION 赋值 undefined 而不是 delete：delete 会把对象推进字典属性模式
+            if (effect.parent !== undefined) effect.parent = undefined
+            if (!ignoreChildren) {
+                effect.destroyChildren()
+            } else if (effect._children) {
+                // CAUTION ignoreChildren 语义是"留下 children 由调用方自行管理"，
+                //  但必须断开它们的 parent 反向指针：否则这些孤儿 child 之后被单独
+                //  destroy 时，会在已清空的 siblings 数组上做 last 替换（pop 出
+                //  undefined 后写 last.index 直接 TypeError）。
+                const children = effect._children
+                for (let i = 0; i < children.length; i++) {
+                    if (children[i].parent === effect) children[i].parent = undefined
+                }
+                children.length = 0
             }
-            children.length = 0
+            effect.dispatch('destroy')
+        } finally {
+            if (isolated) notifier.resetTracking()
         }
-        effect.dispatch('destroy')
     }
 
     deps: Dep[] = SHARED_EMPTY_DEPS
@@ -146,7 +176,7 @@ export class ReactiveEffect extends ManualCleanup {
         const scopes = ReactiveEffect.activeScopes
         if (scopes.length) {
             const parent = scopes[scopes.length - 1]
-            if (parent.shouldCollectChild) {
+            if (parent.shouldCollectChild && parent._children !== CHILDREN_IN_TEARDOWN) {
                 this.parent = parent
                 this.index = parent.addChild(this)
             }
@@ -192,13 +222,32 @@ export class ReactiveEffect extends ManualCleanup {
     }
     destroyChildren() {
         const children = this._children
-        if (!children) return
+        if (!children || children === CHILDREN_IN_TEARDOWN) return
         if (children.length) {
-            children.forEach(child => {
-                // CAUTION 走实例方法（fromParent=true）：destroy 可能被子类覆写，
-                //  静态调用会绕过覆写与 destroyResources 钩子链。
-                child.destroy(false, true)
-            })
+            // CAUTION prepareTracking 在本 effect 入栈之后、enableTracking 之前调用这里，
+            //  子 effect 的清理（含 destroy 覆写）因此跑在本 effect 的帧里：
+            //  1. 读取不追踪（见 isolateTeardown；逐个子 effect 的静态 destroy 也会隔离，这里
+            //     覆盖 destroy 覆写里的用户代码，并让逐个销毁不再重复开关）；
+            //  2. 清理里创建的 effect 不收集：曾被追加进正在销毁的数组、随数组一起丢弃，
+            //     却留着 parent 与这一代数组的 index——之后单独 destroy 时按陈旧 index
+            //     在新 children 上做 swap-pop，删掉无关的兄弟（兄弟从此不随宿主重算
+            //     销毁）。生命周期不变：此前同样不会被本 effect 销毁。
+            //  抛错时还原 children：尚未销毁的子 effect 由下一次 destroyChildren 处理。
+            this._children = CHILDREN_IN_TEARDOWN
+            let completed = false
+            const isolated = isolateTeardown()
+            try {
+                children.forEach(child => {
+                    // CAUTION 走实例方法（fromParent=true）：destroy 可能被子类覆写，
+                    //  静态调用会绕过覆写与 destroyResources 钩子链。
+                    child.destroy(false, true)
+                })
+                completed = true
+            } finally {
+                if (isolated) notifier.resetTracking()
+                this._children = completed ? undefined : children
+            }
+            return
         }
         this._children = undefined
     }
