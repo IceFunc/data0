@@ -278,6 +278,31 @@ describe('a child cleanup that throws while its parent re-runs', () => {
         stops.forEach(s => s())
     })
 
+    test('full cleanup mode: a read in the throwing cleanup leaves no marker bit behind', () => {
+        // patch 型 computed 不用依赖标记。清理在抛错前读了 x：x 的 dep 上不能留下本深度的
+        // 标记位，否则之后在同一深度读 x 的 effect 会被判为已订阅，从此收不到 x 的变化。
+        const source = atom(0)
+        const x = atom(0)
+        let shouldThrow = false
+        const host = computed<number>(function (this: Computed) {
+            this.manualTrack(source, TrackOpTypes.ATOM, 'value')
+            autorun(({onCleanup}) => { onCleanup(() => { x(); if (shouldThrow) throw new Error('child cleanup') }) }, true)
+            return source.raw
+        }, () => false)
+        host()
+        shouldThrow = true
+        expect(() => source(1)).toThrow('child cleanup')
+        shouldThrow = false
+
+        let runs = 0
+        const stop = autorun(() => { x(); runs++ }, true)
+        expect(subscribers(x)).toHaveLength(1)
+        x(1)
+        expect(runs).toBe(2)
+        stop()
+        destroyComputed(host)
+    })
+
     test('an async getter settles like a generator getter', async () => {
         for (const getter of [async () => { body() }, function* (): any { body() }]) {
             var dep = atom(0)

@@ -277,9 +277,12 @@ export class ReactiveEffect extends ManualCleanup {
             this.destroyChildren()
         } catch (err) {
             // marker 模式下把上一轮的依赖全部视为本轮已收集，finalizeDepMarkers 保留它们并
-            // 复位位标记；full cleanup 模式的依赖已在上面清空，由调用方的错误恢复处理
-            // （Computed 的 restoreEffectDeps）。
-            if (!isAsync) retainDepMarkers(this)
+            // 复位位标记。
+            // CAUTION full cleanup 模式不能标记：依赖已在上面清空，清理里读到的 atom 此刻可能已被
+            //  追踪成新依赖，而该模式下 completeTracking 不做 finalize，位标记会留在 dep 上——
+            //  之后同一深度读这个 atom 的 effect 会被判为已订阅而静默漏订阅。该模式的依赖由
+            //  调用方的错误恢复处理（Computed 的 restoreEffectDeps）。
+            if (!isAsync && this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) retainDepMarkers(this)
             this.completeTracking(false, isAsync)
             throw err
         }
