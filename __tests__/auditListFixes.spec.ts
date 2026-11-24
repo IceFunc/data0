@@ -600,6 +600,27 @@ describe('map: a row cleanup that throws does not keep the other rows from being
         expect(optionCleaned).toEqual([1, 2])
         expect(mapped.data.length).toBe(1)
     })
+    test('set (single row): a child effect of the replaced row whose cleanup throws does not skip the row\'s other cleanups', () => {
+        const source = new RxList<number>([1, 2])
+        const contextCleaned: number[] = []
+        const optionCleaned: number[] = []
+        const mapped = source.map((item, _index, {onCleanup}) => {
+            computed(({onCleanup: onChildCleanup}) => {
+                onChildCleanup(() => { if (item === 1) throw new Error('child cleanup boom') })
+                return item
+            })
+            onCleanup(() => contextCleaned.push(item))
+            return item * 10
+        }, {onCleanup: value => optionCleaned.push(value)})
+        vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        expect(() => source.set(0, 7)).toThrow('child cleanup boom')
+        expect(contextCleaned).toEqual([1])
+        expect(optionCleaned).toEqual([10])
+        expect(mapped.data).toEqual([70, 20])
+        mapped.destroy()
+        expect(contextCleaned).toEqual([1, 7, 2])
+        expect(optionCleaned).toEqual([10, 70, 20])
+    })
 })
 
 describe('filter: indicator is committed before the filtered list changes (reactions during the dispatch see a consistent state)', () => {
@@ -723,6 +744,24 @@ describe('filter: one shared predicate dependency flipping many rows', () => {
             }
             mirror.destroy(); filtered.destroy(); source.destroy()
         }
+    })
+    test('the error-recovery full recompute invalidates the locate cursor (rows shift under a parked cursor)', () => {
+        vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const boom = atom(true)
+        const row = (id: string) => ({id, on: atom(true)})
+        const rows = 'ABCDEFGHIJ'.split('').map(row)
+        const [, , , , , , G, , , J] = rows
+        const late = row('Z')
+        const source = new RxList(rows.slice())
+        const filtered = source.filter(x => { if (x.id === 'Z' && boom()) throw new Error('predicate boom'); return x.on() })
+        expect(() => source.push(late)).toThrow('predicate boom')   // the row list's patch throws: it recovers by a full recompute
+        G.on(false)                                                    // a toggle parks the cursor on row 6
+        boom(false)
+        source.splice(0, 3)                                            // recovery rebuild: every row moves up by 3
+        J.on(false)                                                    // J is row 6 now: a stale cursor would place it at 6
+        expect(filtered.data.map(x => x.id)).toEqual(source.data.filter(x => x.on.raw).map(x => x.id))
+        vi.restoreAllMocks()
+        filtered.destroy(); source.destroy()
     })
     test('rows scanned: linear in subscription order, never worse than the scan from row 0 when shuffled', () => {
         const small = flipAll(1000, false), large = flipAll(4000, false)
