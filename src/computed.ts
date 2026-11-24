@@ -9,7 +9,7 @@ import {
     setRetainedReactiveEffectSource,
     trackRetainedReactiveEffectCreated
 } from "./retainedDiagnostics";
-import {restoreEffectDeps} from "./dep.js";
+import {restoreEffectDeps, type Dep} from "./dep.js";
 
 export const computedToInternal = new WeakMap<any, Computed>()
 
@@ -798,9 +798,14 @@ export class Computed extends ReactiveEffect {
                     console.error('[data0] suppressed subscriber error in recompute digest (writing the result itself threw; propagating that error):', digestErr)
                 }
             }
+            // 与 getter 抛错同一规则（见 fullRecompute）：同步首轮的错误抛给创建者，创建者拿不到句柄，
+            //  不能留下订阅——否则之后每次写依赖都会重跑这个没人能销毁的 computed，并把错误抛给写入方。
+            if (!this.isAsync && this._updatedAtTime === undefined) restoreEffectDeps(this)
             this.handleRecomputeError(err, true)
             throw err
         }
+        // 成功：失败期间保存的「上一次成功的依赖」作废（只在确实保存过时写，不给每个实例加自有属性）
+        if (this._depsAtLastSuccess !== undefined) this._depsAtLastSuccess = undefined
 
         if (this.applyPatch) {
             this.phase = PATCH_PHASE
@@ -829,7 +834,13 @@ export class Computed extends ReactiveEffect {
         // 失败重算必须保住“上一次成功”的完整依赖集合，并且留下失败这一轮已经读到的依赖
         // （见 restoreEffectDeps 的 keepCollected）。prepareTracking 可能在
         // getter 第一次读取前就清掉旧 deps，或在抛错前只收集了一部分新 deps。
-        const previousDeps = this.deps.length ? this.deps.slice() : undefined
+        // CAUTION 有界：连续失败时，本轮开始时的 deps 已经包含上一次失败留下的依赖；以它为基础
+        //  就是逐轮累积的并集（失败期间读过的每个 key 都留下订阅，写这些早已无关的 key 也会
+        //  触发重试、把错误抛给写入方）。连续失败期间一律以「上一次成功的依赖」为基础：
+        //  保留的始终是「上一次成功 ∪ 当前这一轮读到的」。
+        const previousDeps = this._depsAtLastSuccess !== undefined
+            ? this._depsAtLastSuccess.slice()
+            : (this.deps.length ? this.deps.slice() : undefined)
         this.inPatch = false
         // CAUTION 一条规则：全量重算一旦开始，此前为本 computed 排队的一切都不得再叠加到它的
         //  结果上——getter 读到的已经是包含这些变更的源状态，再应用一次就是重复应用。
@@ -876,6 +887,7 @@ export class Computed extends ReactiveEffect {
                 if (this.recomputeId !== recomputeId) return
                 // async computed 一定已经交到创建者手里（computed() 同步返回），首轮失败也保留
                 // 这一轮读到的依赖：否则它没有任何依赖，输入改好之后也永远不会重试。
+                if (this._depsAtLastSuccess === undefined) this._depsAtLastSuccess = previousDeps ? previousDeps.slice() : []
                 restoreEffectDeps(this, previousDeps, true)
                 this.handleRecomputeError(err)
             }).catch((finishErr: any) => {
@@ -899,7 +911,9 @@ export class Computed extends ReactiveEffect {
                 // CAUTION 同步首轮（还没有成功过一次，_updatedAtTime 未写）抛错时不保留本轮依赖：
                 //  异常直接抛给创建者，computed()/autorun()/new RxList(getter) 都拿不到句柄，
                 //  留着订阅就是一个没人能销毁、还会在依赖变化时重跑的僵尸。成功过之后才取并集。
-                restoreEffectDeps(this, previousDeps, this._updatedAtTime !== undefined)
+                const keepCollected = this._updatedAtTime !== undefined
+                if (keepCollected && this._depsAtLastSuccess === undefined) this._depsAtLastSuccess = previousDeps ? previousDeps.slice() : []
+                restoreEffectDeps(this, previousDeps, keepCollected)
                 this.handleRecomputeError(err, true)
             }
             throw err
@@ -1075,6 +1089,9 @@ export class Computed extends ReactiveEffect {
     //  下一轮消化，不需要也不应该再强制全量。
     /** @internal */
     declare _rerunAfterRun: boolean
+    // 连续失败期间「上一次成功时的依赖」（见 fullRecompute 的有界并集）；没有在失败中时为 undefined。
+    /** @internal */
+    declare _depsAtLastSuccess: Dep[] | undefined
     /** @internal */
     forcedRecompute() {
         if (ReactiveEffect.activeScopes.includes(this)) {
@@ -1281,6 +1298,8 @@ export class Computed extends ReactiveEffect {
         } finally {
             // 计算尚未完成就被销毁时，解除所有 await cleanPromise 的等待方
             this.settleCleanPromise()
+            // 失败期间保存的依赖快照不再有用，别让已销毁的 computed 继续持有这些 dep
+            if (this._depsAtLastSuccess !== undefined) this._depsAtLastSuccess = undefined
             super.destroyResources()
         }
     }
@@ -1296,6 +1315,7 @@ Computed.prototype._cleanExpected = false
 Computed.prototype.preventEffectSession = false
 Computed.prototype._asyncGetterWarned = false
 Computed.prototype._rerunAfterRun = false
+Computed.prototype._depsAtLastSuccess = undefined
 
 /**
  * @category Basic

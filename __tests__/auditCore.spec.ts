@@ -1205,3 +1205,67 @@ describe('R-X4 scheduled recompute dedupe', () => {
         stopFeedback(); destroyComputed(c)
     })
 })
+
+// review of this PR: R-F6 handled the write-result entry without the sync-first-run rule R-F1 pins for the
+// getter entry, and R-F1's union grew with every failure of a streak (AGENTS §4: bounded bookkeeping).
+describe('R-F9 failure recovery: same rules at every entry, bounded across a failure streak', () => {
+    test('sync first run whose result write throws: nothing stays subscribed', () => {
+        const a = atom(0)
+        expect(() => computed(() => { a(); return atom.lazy(() => { throw new Error('lazy boom') }) })).toThrow('lazy boom')
+        expect(subscribers(a)).toEqual([])
+        expect(() => a(1)).not.toThrow()
+
+        const remote = atom<[string, number][] | undefined>(undefined)
+        expect(() => new RxMap<string, number>(function () { return remote() as any } as any)).toThrow(TypeError)
+        expect(subscribers(remote)).toEqual([])
+        remote([['k', 1]])
+        expect(subscribers(remote)).toEqual([])
+    })
+
+    test('sync: a failure streak keeps only (last success ∪ the current failing run)', () => {
+        const map = new RxMap<number, string>([[0, 'zero']])
+        const k = atom(0)
+        const c = computed(() => {
+            const key = k()
+            const v = map.get(key)
+            if (v === undefined) throw new Error('missing ' + key)
+            return v
+        })
+        for (let i = 1; i <= 200; i++) expect(() => k(i)).toThrow('missing ' + i)
+        // {k, map[0]} from the last success ∪ {k, map[200]} from the current failure
+        expect(getComputedInternal(c)!.deps.length).toBeLessThanOrEqual(3)
+        // key 3 was read by a failure long gone: writing it is not this computed's business
+        expect(() => map.set(3, 'three')).not.toThrow()
+        // the last success's dependency still retries, the current failure's key still recovers
+        expect(() => map.set(0, 'ZERO')).toThrow('missing 200')
+        map.set(200, 'two hundred')
+        expect(c()).toBe('two hundred')
+        // success: the dependency set is exact again
+        expect(getComputedInternal(c)!.deps.length).toBe(2)
+        destroyComputed(c)
+        map.destroy()
+    })
+
+    test('async: the same streak stays bounded, stale keys do not retry', async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        const map = new RxMap<number, string>([[0, 'zero']])
+        const k = atom(0)
+        const c = computed(async () => {
+            const key = k()
+            const v = map.get(key)
+            if (v === undefined) throw new Error('missing ' + key)
+            return v
+        })
+        await tick()
+        for (let i = 1; i <= 100; i++) { k(i); await tick() }
+        expect(getComputedInternal(c)!.deps.length).toBeLessThanOrEqual(3)
+        const before = errors.mock.calls.length
+        map.set(3, 'three'); await tick()
+        expect(errors.mock.calls.length - before).toBe(0)
+        map.set(100, 'hundred'); await tick()
+        expect(c.raw).toBe('hundred')
+        destroyComputed(c)
+        map.destroy()
+    })
+})
