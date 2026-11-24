@@ -205,3 +205,57 @@ describe('collection destroyResources finishes every step after a throwing clean
         }
     })
 })
+
+// ---------------------------------------------------------------------------
+// values()/entries() position bookkeeping (createEntryList's key -> position hints) is bounded: a deleted key
+// leaves no entry behind. Not observable through behaviour (stale hints are never looked up), so this is a
+// real-GC reachability check: churn unique object keys through a long-lived map, delete them all, and every
+// key object must be collectable. The GC is exposed through v8 flags inside the test (no CLI flag needed).
+// ---------------------------------------------------------------------------
+describe('values()/entries() bookkeeping keeps nothing for deleted keys (GC churn)', () => {
+    const exposeGc = async (): Promise<() => void> => {
+        const v8 = await import('node:v8')
+        const vm = await import('node:vm')
+        v8.setFlagsFromString('--expose-gc')
+        return vm.runInNewContext('gc') as () => void
+    }
+    const settle = async (gc: () => void) => {
+        for (let i = 0; i < 5; i++) {
+            gc()
+            await new Promise(resolve => setTimeout(resolve, 5))
+        }
+    }
+    // allocation in its own stack frame: a same-frame local would be pinned by conservative stack scanning
+    const churn = (m: RxMap<object, number>, rounds: number): WeakRef<object>[] => {
+        const refs: WeakRef<object>[] = []
+        for (let i = 0; i < rounds; i++) {
+            const key = {i}
+            m.set(key, i)
+            m.set(key, i + 1)          // an update locates the key: the position hints now hold it
+            m.delete(key)
+            refs.push(new WeakRef(key))
+        }
+        return refs
+    }
+    const pinnedChurn = (m: RxMap<object, number>, pin: object[]): WeakRef<object>[] => {
+        const key = {pinned: true}
+        pin.push(key)                  // negative control: a key that is still referenced must stay alive
+        m.set(key, 1); m.set(key, 2); m.delete(key)
+        return [new WeakRef(key)]
+    }
+
+    test('200 unique keys set, updated and deleted with values()/entries() attached: all collectable', async () => {
+        const gc = await exposeGc()
+        const anchor = {}
+        const m = new RxMap<object, number>([[anchor, 0]])
+        const values = m.values(), entries = m.entries()
+        const refs = churn(m, 200)
+        const pin: object[] = []
+        const control = pinnedChurn(m, pin)
+        await settle(gc)
+        expect(refs.filter(r => r.deref() !== undefined).length).toBe(0)
+        expect(control[0].deref()).toBe(pin[0])
+        expect([values.data, entries.data.map(e => e[1])]).toEqual([[0], [0]])
+        m.destroy()
+    })
+})
