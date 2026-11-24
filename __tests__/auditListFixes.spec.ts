@@ -457,32 +457,30 @@ describe('spliceArray: items may be the list\'s own data array', () => {
     })
 })
 
-describe('at(): non-integer indexes follow Array#at (ToIntegerOrInfinity)', () => {
-    const args = [1.5, 1.999, 0.9, -0.9, -0.5, -1.5, -2.2, -3.999, 2.5, 3.5, -4.5, NaN, Infinity, -Infinity, -0, 0, 1, 2, 3, -1, -3, -4, 100.5, -100.5]
-    test('same result as Array#at for every argument', () => {
-        for (const data of [[], [10], [10, 20, 30]]) {
-            const list = new RxList<number>(data.slice())
-            for (const arg of args) {
-                expect(list.at(arg), `[${data}].at(${arg})`).toBe(data.at(arg))
-            }
-        }
+describe('at(): a non-integer index is a plain property key, symmetric with set (README §4)', () => {
+    // set(1.5, v) is a plain array property write that triggers key 1.5 (README §4, key passed through);
+    // at(1.5) must read that same property and subscribe that same key -- not truncate to row 1.
+    test('at(1.5) reads what set(1.5, v) wrote, and a computed reading it re-runs', () => {
+        const list = new RxList<any>([10, 20, 30])
+        const fractional = computed(() => list.at(1.5))
+        expect(fractional.raw).toBe(undefined)
+        expect(list.at(1.5)).toBe(undefined)
+        list.set(1.5, 'x')
+        expect(list.at(1.5)).toBe('x')
+        expect(fractional.raw).toBe('x')
+        list.set(1, 'y')                        // row 1 is a different key
+        expect(fractional.raw).toBe('x')
+        expect(list.at(1)).toBe('y')
+        list.set(1.5, 'z')
+        expect(fractional.raw).toBe('z')
     })
-    test('a fractional index subscribes to the row it reads', () => {
-        const list = new RxList<number>([10, 20, 30])
-        const second = computed(() => list.at(1.7))
-        const lastish = computed(() => list.at(-1.5))
-        const first = computed(() => list.at(NaN))
-        expect([second.raw, lastish.raw, first.raw]).toEqual([20, 30, 10])
-        list.set(1, 21)
-        expect(second.raw).toBe(21)
-        list.push(40)
-        expect(lastish.raw).toBe(40)
-        list.unshift(5)
-        expect([second.raw, lastish.raw, first.raw]).toEqual([10, 40, 5])
-        list.swap(0, 1)
-        expect([second.raw, first.raw]).toEqual([5, 10])
-        list.splice(0, Infinity)
-        expect([second.raw, lastish.raw, first.raw]).toEqual([undefined, undefined, undefined])
+    test('NaN behaves the same way (property "NaN"), integer and negative indexes are unchanged', () => {
+        const list = new RxList<any>([10, 20, 30])
+        const viaNaN = computed(() => list.at(NaN))
+        expect(viaNaN.raw).toBe(undefined)
+        list.set(NaN, 'n')
+        expect(viaNaN.raw).toBe('n')
+        expect([list.at(0), list.at(2), list.at(-1), list.at(-3), list.at(3)]).toEqual([10, 30, 30, 10, undefined])
     })
 })
 

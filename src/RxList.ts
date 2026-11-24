@@ -889,14 +889,11 @@ export class RxList<T> extends Computed {
         // 规范下标字符串归一化(与 set 对称):at("2") 必须与 set(2) 的触发 key
         // 落在同一个 dep 上,否则订阅永久漏触发(见 normalizeIndexKey)
         index = normalizeIndexKey(index) as number
-        // CAUTION 非整数下标按 Array.prototype.at 的 ToIntegerOrInfinity 归一化（与 splice
-        //  参数同一原则）：at(1.7) 读第 1 行、at(-1.5) 读末行、at(NaN) 读第 0 行。旧实现
-        //  原样拿小数/NaN 当属性名——读出恒为 undefined，订阅还挂在一个任何变更都不会
-        //  触发的 key 上（set(1, v) 触发的是 key 1），与平台语义和本方法"与
-        //  Array.prototype.at 一致"的承诺都不符。整数下标（热路径）只多一次判断；
-        //  ±Infinity 归一化后不变（越界，读出 undefined）；非 number 的 key 仍按
-        //  normalizeIndexKey 的规则处理（与 set 对称），不在此改写。
-        if (typeof index === 'number' && !Number.isInteger(index)) index = toIntegerOrInfinity(index)
+        // CAUTION 非整数下标（1.5、NaN）**不**按 Array.prototype.at 取整：key 与 set 对称地
+        //  原样当作属性名（README §4：set 的非整数 key 等同普通数组赋值、key 原样透传）。
+        //  set(1.5, v) 写的是属性 "1.5" 并触发 key 1.5，at(1.5) 读同一个属性、订阅同一个
+        //  key——读写对称、订阅会被触发。取整会让 at(1.5) 改读第 1 行，与 set(1.5) 写入的
+        //  位置分叉（曾在审查修复中误改，已回退并由回归测试钉住）。
         // 与 Array.prototype.at 一致：支持负索引（从末尾回数）。
         // CAUTION 负索引的结果依赖 length，不能建 index dep（元素本身没变时对应
         //  index 不会触发 SET），track ITERATE_KEY——所有结构变更（splice/reorder/set）
