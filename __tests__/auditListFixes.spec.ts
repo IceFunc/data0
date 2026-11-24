@@ -1,6 +1,7 @@
 import {afterEach, describe, expect, test, vi} from 'vitest'
 import {atom, Atom, batch, computed, onChange, RxList, RxSet} from '../src/index'
 import {mulberry32} from './fuzzKit'
+import {countPrimitiveRawReads} from './listWorkCounters'
 
 /**
  * Regression tests for the branches touched by the audit fixes (the minimal
@@ -342,44 +343,28 @@ describe('sortSelf: undefined elements follow Array#sort (never passed to the co
     })
 })
 
-const time = (fn: () => void) => { const t0 = performance.now(); fn(); return performance.now() - t0 }
-const median = (xs: number[]) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)]
-
 describe('filter: tail operations cost O(suffix); the mid-list path is unchanged', () => {
-    const build = (n: number) => {
+    // rows scanned (indicator `.raw` reads) by `repeat` operations on an n-row source
+    const scanned = (n: number, op: (source: RxList<number>, i: number) => void, repeat: number) => {
         const source = new RxList<number>(Array.from({length: n}, (_, i) => i))
         const filtered = source.filter(x => x % 2 === 0)
-        return {source, filtered}
-    }
-    const measure = (n: number, op: (source: RxList<number>, i: number) => void, repeat: number) => median([0, 1, 2].map(() => {
-        const {source, filtered} = build(n)
-        const t = time(() => { for (let i = 0; i < repeat; i++) op(source, i) })
+        const reads = countPrimitiveRawReads(() => { for (let i = 0; i < repeat; i++) op(source, i) })
         expect(filtered.data).toEqual(source.data.filter(x => x % 2 === 0))
         filtered.destroy(); source.destroy()
-        return t
-    }))
-    test('timings at 5k and 80k rows: push / pop / tail replace are flat, mid-list splice stays linear', () => {
-        measure(1000, (s, i) => s.push(i), 200) // warm up
-        const rows: string[] = []
-        const cases: [string, (s: RxList<number>, i: number) => void, number][] = [
-            ['push x2000', (s, i) => s.push(i), 2000],
-            ['pop x2000', s => s.pop(), 2000],
-            ['splice(len-2, 2, a, b) x2000', (s, i) => s.splice(s.data.length - 2, 2, i, i + 1), 2000],
-            ['mid-list splice(len/2, 1, a) x300', (s, i) => s.splice(s.data.length >> 1, 1, i), 300],
-            ['mid-list set(len/2, a) x300', (s, i) => s.set(s.data.length >> 1, i), 300],
+        return reads
+    }
+    test('rows scanned by push / pop / tail replace do not depend on the list length (2k vs 32k rows)', () => {
+        const cases: [string, (s: RxList<number>, i: number) => void][] = [
+            ['push', (s, i) => s.push(i)],
+            ['pop', s => s.pop()],
+            ['splice(len-2, 2, a, b)', (s, i) => s.splice(s.data.length - 2, 2, i, i + 1)],
+            ['splice(-3, Infinity)', s => { s.splice(-3, Infinity); s.push(1, 2, 3) }],
         ]
-        const ratios: Record<string, number> = {}
-        for (const [name, op, repeat] of cases) {
-            const small = measure(5000, op, repeat)
-            const large = measure(80000, op, repeat)
-            ratios[name] = large / small
-            rows.push(`${name}: 5k ${small.toFixed(1)}ms, 80k ${large.toFixed(1)}ms, ratio ${(large / small).toFixed(1)}`)
+        for (const [name, op] of cases) {
+            // the old prefix scan reads every row per operation: 300 x 30000 more on the larger list
+            expect(scanned(32000, op, 300), name).toBe(scanned(2000, op, 300))
         }
-        console.log('FILTER TIMINGS\n  ' + rows.join('\n  '))
-        expect(ratios['push x2000']).toBeLessThan(4)
-        expect(ratios['pop x2000']).toBeLessThan(4)
-        expect(ratios['splice(len-2, 2, a, b) x2000']).toBeLessThan(4)
-    }, 120000)
+    })
     test('tail shapes: truncation, tail replace with mixed matches, clear, replace-all, batched tail ops, reactive predicate', () => {
         const flip = atom(0)
         const source = new RxList<number>([1, 2, 3, 4, 5, 6, 7, 8])
@@ -685,6 +670,7 @@ describe('filter: indicator is committed before the filtered list changes (react
 })
 
 describe('filter: one shared predicate dependency flipping many rows', () => {
+    // rows scanned (indicator `.raw` reads) when one shared dependency flips every row off, on, then half off
     const flipAll = (n: number, shuffled: boolean) => {
         const threshold = atom(-1)
         const source = new RxList<number>(Array.from({length: n}, (_, i) => i))
@@ -695,11 +681,11 @@ describe('filter: one shared predicate dependency flipping many rows', () => {
             const keys = new Map<number, number>(source.data.map(x => [x, rand()]))
             source.sortSelf((a, b) => keys.get(a)! - keys.get(b)!)
         }
-        const off = time(() => { threshold(n) })
+        const off = countPrimitiveRawReads(() => { threshold(n) })
         expect(filtered.data).toEqual([])
-        const on = time(() => { threshold(-1) })
+        const on = countPrimitiveRawReads(() => { threshold(-1) })
         expect(filtered.data).toEqual(source.data)
-        const half = time(() => { threshold(n / 2) })
+        const half = countPrimitiveRawReads(() => { threshold(n / 2) })
         expect(filtered.data).toEqual(source.data.filter(x => x > n / 2))
         filtered.destroy(); source.destroy()
         return {off, on, half}
@@ -738,22 +724,18 @@ describe('filter: one shared predicate dependency flipping many rows', () => {
             mirror.destroy(); filtered.destroy(); source.destroy()
         }
     })
-    test('timings at 10k and 40k rows (rows in subscription order, and shuffled)', () => {
-        flipAll(2000, false) // warm up
-        const rows: string[] = []
-        const result: Record<string, {off: number, on: number, half: number}> = {}
-        for (const shuffled of [false, true]) {
-            // shuffled rows stay quadratic (every locate falls back to the scan from row 0): smaller sizes keep the test short
-            for (const n of shuffled ? [5000, 10000] : [10000, 40000]) {
-                const r = flipAll(n, shuffled)
-                result[`${shuffled}:${n}`] = r
-                rows.push(`${shuffled ? 'shuffled' : 'in order'} n=${n}: all off ${r.off.toFixed(1)}ms, all on ${r.on.toFixed(1)}ms, half off ${r.half.toFixed(1)}ms`)
-            }
+    test('rows scanned: linear in subscription order, never worse than the scan from row 0 when shuffled', () => {
+        const small = flipAll(1000, false), large = flipAll(4000, false)
+        // in subscription order every row is located from the previous one: 4x rows -> ~4x reads
+        // (the scan from row 0 per flip is ~n^2/2 reads: 16x)
+        for (const phase of ['off', 'on', 'half'] as const) {
+            expect(large[phase] / small[phase], phase).toBeLessThan(5)
         }
-        console.log('FILTER SHARED-DEP TIMINGS\n  ' + rows.join('\n  '))
-        // in subscription order every row is located from the previous one: turning all rows on is linear
-        expect(result['false:40000'].on / result['false:10000'].on).toBeLessThan(10)
-    }, 240000)
+        // shuffled rows fall back to the scan from row 0 (at most one extra window of reads per flip)
+        const shuffled = flipAll(1000, true)
+        const scanFromZero = 1000 * 1000                       // upper bound of the old per-flip prefix scans
+        expect(shuffled.on).toBeLessThan(scanFromZero + 1000 * 64 + 10 * 1000)
+    })
 })
 
 describe('map: reactive rows recomputing while a structural change is still pending', () => {

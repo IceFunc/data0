@@ -1,5 +1,6 @@
 import {describe, expect, test} from 'vitest'
 import {atom, batch, onChange, recompute, RxList, RxMap} from '../src/index'
+import {countPrimitiveRawReads, countSourceScans} from './listWorkCounters'
 
 /**
  * Audit findings for RxList derived operators. Every test in this file is
@@ -208,40 +209,34 @@ describe('F8 (core reviewer) destroy with a throwing context.onCleanup skips the
     })
 })
 
-const time = (fn: () => void) => { const t = performance.now(); fn(); return performance.now() - t }
-const median = (xs: number[]) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)]
+// Scale findings are asserted with deterministic work counters (rows scanned / elements visited), not wall clock.
 
 describe('P1 filter: a tail push rescans every row (O(n) per push, loops are quadratic)', () => {
-    test('cost of 2000 pushes must not depend on how long the list already is', () => {
+    test('rows scanned by 2000 pushes must not depend on how long the list already is', () => {
         const run = (n: number) => {
             const source = new RxList<number>(Array.from({length: n}, (_, i) => i))
             const filtered = source.filter(x => x % 2 === 0)
-            const t = time(() => { for (let i = 0; i < 2000; i++) source.push(i) })
+            const reads = countPrimitiveRawReads(() => { for (let i = 0; i < 2000; i++) source.push(i) })
+            expect(filtered.data).toEqual(source.data.filter(x => x % 2 === 0))
             filtered.destroy(); source.destroy()
-            return t
+            return reads
         }
-        run(1000) // warm up
-        const small = median([run(5000), run(5000), run(5000)])
-        const large = median([run(80000), run(80000), run(80000)])
-        console.log(`P1 filter: 2000 pushes onto 5k rows ${small.toFixed(1)}ms, onto 80k rows ${large.toFixed(1)}ms, ratio ${(large / small).toFixed(1)}`)
-        expect(large / small).toBeLessThan(4)
+        const small = run(2000), large = run(32000)
+        // the old prefix scan reads every row on every push: large - small = 2000 x 30000
+        expect(large).toBe(small)
     })
 })
 
 describe('P2 toSet: bulk delete is O(deleted x remaining)', () => {
-    test('removing half of the list scales linearly', () => {
-        const run = (n: number) => {
-            const source = new RxList<number>(Array.from({length: n}, (_, i) => i))
-            const set = source.toSet()
-            const t = time(() => { source.splice(0, n / 2) })
-            expect(set.data.size).toBe(n / 2)
-            set.destroy(); source.destroy()
-            return t
-        }
-        run(2000) // warm up
-        const small = median([run(10000), run(10000), run(10000)])
-        const large = median([run(80000), run(80000), run(80000)])
-        console.log(`P2 toSet: splice(0, n/2) n=10k ${small.toFixed(1)}ms, n=80k ${large.toFixed(1)}ms, ratio ${(large / small).toFixed(1)} (linear would be ~8)`)
-        expect(large / small).toBeLessThan(24)
+    test('removing half of the list does not scan the source once per removed row', () => {
+        const n = 20000
+        const source = new RxList<number>(Array.from({length: n}, (_, i) => i))
+        const set = source.toSet()
+        const counter = countSourceScans(source)
+        source.splice(0, n / 2)
+        expect(set.data.size).toBe(n / 2)
+        // one scan per removed row would visit (n/2) x (n/2) = 10^8 elements
+        expect(counter.scanned).toBe(0)
+        set.destroy(); source.destroy()
     })
 })
