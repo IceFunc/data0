@@ -1,7 +1,7 @@
 import {RxList} from "./RxList.js";
 import {Atom, atom} from "./atom.js";
 import {computed, destroyComputed} from "./computed.js";
-import {ReactiveEffect} from "./reactiveEffect.js";
+import {ReactiveEffect, reportTeardownError} from "./reactiveEffect.js";
 import {warn} from "./util.js";
 
 type GetRemoteData<T> = (cursor?: number, length?: number, stop?: number, fetchBeforeCursor?: boolean) => Promise<T[]>
@@ -125,11 +125,43 @@ export class AsyncRxSlice<T> extends RxList<T>{
         // 作废一切在途 fetch/update：回调只认 receipt 匹配。不 bump 的话，
         // destroy 后仍可能写入 loadError / isLoading（僵尸控制态）。
         this.fetchReceipt++
-        this.isLoading(false)
-        this.loadError(null)
-        if (this.autoFetchPromise) {
-            destroyComputed(this.autoFetchPromise)
+        // CAUTION 下面每一步都会执行用户代码（isLoading/loadError 的订阅者、autoFetchPromise 的
+        //  destroy 监听者），抛错不能跳过其余步骤（「销毁必须做完」，README §6）：曾是顺序执行，
+        //  一处抛错，autoFetchPromise 就还活着、还订阅着 getRemoteData 读到的参数（参数一变就
+        //  再请求远端），RxList 的基类钩子（length、行级 effect）也整个跳过。第一个错误抛给调用方，
+        //  其后的走 reportTeardownError（同 RxList.destroyResources）。
+        let failed = false
+        let first: unknown
+        const record = (error: unknown) => {
+            if (failed) {
+                reportTeardownError(error)
+            } else {
+                failed = true
+                first = error
+            }
         }
-        super.destroyResources()
+        try {
+            this.isLoading(false)
+        } catch (error) {
+            record(error)
+        }
+        try {
+            this.loadError(null)
+        } catch (error) {
+            record(error)
+        }
+        if (this.autoFetchPromise) {
+            try {
+                destroyComputed(this.autoFetchPromise)
+            } catch (error) {
+                record(error)
+            }
+        }
+        try {
+            super.destroyResources()
+        } catch (error) {
+            record(error)
+        }
+        if (failed) throw first
     }
 }

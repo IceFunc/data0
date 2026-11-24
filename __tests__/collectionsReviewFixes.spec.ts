@@ -3,11 +3,12 @@
  * Each describe block belongs to one root cause; every test failed on the tree before its fix.
  */
 import {afterEach, describe, expect, test, vi} from 'vitest'
-import {atom, batch, onChange, RxList, RxMap, RxSet, RxTime} from '../src/index'
-import {Computed} from '../src/computed.js'
-import {ITERATE_KEY} from '../src/notify.js'
+import {AsyncRxSlice, atom, batch, onChange, RxList, RxMap, RxSet, RxTime} from '../src/index'
+import {Computed, getComputedInternal} from '../src/computed.js'
+import {ITERATE_KEY, notifier} from '../src/notify.js'
 import {TrackOpTypes} from '../src/operations.js'
 
+const subscribersOf = (target: object) => [...(notifier.getDepEffects(target) ?? [])].length
 const zeroSign = (x: unknown) => Object.is(x, -0) ? '-0' : String(x)
 const sameSeq = (a: readonly unknown[], b: readonly unknown[]) => a.length === b.length && a.every((x, i) => Object.is(x, b[i]))
 
@@ -122,5 +123,85 @@ describe('RxTime: wake-up inside the same Date.now() tick re-arms with a bounded
         expect(vi.getTimerCount()).toBe(1)
         t2.destroy()
         expect(vi.getTimerCount()).toBe(0)
+    })
+})
+
+// ---------------------------------------------------------------------------
+// destroyResources after a throwing user cleanup ("销毁必须做完", README §6): every remaining step still runs,
+// the first error reaches the caller, later ones go to console.error. RxMap / RxSet / AsyncRxSlice used to
+// run their steps in sequence, so one throwing meta left its siblings (and the base hook) undone.
+// ---------------------------------------------------------------------------
+describe('collection destroyResources finishes every step after a throwing cleanup', () => {
+    const boom = (tag: string) => () => { throw new Error(`boom:${tag}`) }
+    const destroyAndCatch = (destroy: () => void) => {
+        try { destroy(); return 'no throw' } catch (e: any) { return e.message as string }
+    }
+    const teardownReports = (spy: ReturnType<typeof vi.spyOn>) =>
+        spy.mock.calls.filter(c => c[0] === '[data0] uncaught error in teardown:').map(c => (c[1] as Error).message)
+
+    test('RxMap: a throwing values() destroy listener does not keep entries()/keys()/size alive or skip context.onCleanup', () => {
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        try {
+            let cleaned = 0
+            const m = new RxMap<string, number>(function (this: RxMap<string, number>, {onCleanup}: any) {
+                onCleanup(() => { cleaned++ })
+                return [['a', 1]]
+            } as any)
+            const values = m.values(), entries = m.entries(), keys = m.keys(), size = m.size
+            values.on('destroy', boom('values'))
+            keys.on('destroy', boom('keys'))
+            expect(destroyAndCatch(() => m.destroy())).toBe('boom:values')
+            expect([m.active, values.active, entries.active, keys.active, getComputedInternal(size)!.active])
+                .toEqual([false, false, false, false, false])
+            expect(cleaned).toBe(1)
+            expect(teardownReports(errorSpy)).toEqual(['boom:keys'])
+            expect(subscribersOf(m)).toBe(0)
+        } finally {
+            errorSpy.mockRestore()
+        }
+    })
+
+    test('RxSet: a throwing size destroy listener does not skip the base hook (context.onCleanup)', () => {
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        try {
+            let cleaned = 0
+            const s = new RxSet<number>(function (this: RxSet<number>, {onCleanup}: any) {
+                onCleanup(() => { cleaned++ })
+                return [1]
+            } as any)
+            const size = s.size
+            getComputedInternal(size)!.on('destroy', boom('size'))
+            expect(destroyAndCatch(() => s.destroy())).toBe('boom:size')
+            expect([s.active, getComputedInternal(size)!.active]).toEqual([false, false])
+            expect(cleaned).toBe(1)
+        } finally {
+            errorSpy.mockRestore()
+        }
+    })
+
+    test('AsyncRxSlice: a throwing isLoading subscriber / autoFetch destroy listener does not keep the fetch computed or length alive', async () => {
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        try {
+            const page = atom(1)
+            let remoteCalls = 0
+            const slice = new AsyncRxSlice<number>([], async () => { remoteCalls++; return [page()] })
+            await slice.fetch()
+            const length = slice.length
+            const fetcher = getComputedInternal(slice.autoFetchPromise!)!
+            fetcher.on('destroy', boom('autoFetch'))
+            slice.isLoading(true)
+            const stopLoadingWatcher = onChange(slice.isLoading, () => { throw new Error('boom:isLoading') })
+
+            expect(destroyAndCatch(() => slice.destroy())).toBe('boom:isLoading')
+            expect([slice.active, fetcher.active, getComputedInternal(length)!.active]).toEqual([false, false, false])
+            expect(teardownReports(errorSpy)).toEqual(['boom:autoFetch'])
+            const callsAtDestroy = remoteCalls
+            page(2)                                   // the fetch computed no longer follows its parameters
+            await new Promise(resolve => setTimeout(resolve, 0))
+            expect(remoteCalls).toBe(callsAtDestroy)
+            stopLoadingWatcher()
+        } finally {
+            errorSpy.mockRestore()
+        }
     })
 })

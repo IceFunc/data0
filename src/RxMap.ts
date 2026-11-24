@@ -13,7 +13,7 @@ import {ITERATE_KEY, notifier} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {Atom} from "./atom.js";
 import {RxList} from "./RxList.js";
-import {ReactiveEffect} from "./reactiveEffect.js";
+import {ReactiveEffect, reportTeardownError} from "./reactiveEffect.js";
 import {assert, isMap, warn} from "./util.js";
 
 type EntryType = [any, any][]
@@ -371,10 +371,42 @@ export class RxMap<K, V> extends Computed{
     destroyResources() {
         // CAUTION 只销毁真正创建过的派生结构（getter 惰性，直接访问会先创建再销毁）。
         //  四个 meta 各自直接订阅本 Map，彼此独立，销毁顺序无关。
-        if (this._values) this._values.destroy()
-        if (this._entries) this._entries.destroy()
-        if (this._keys) this._keys.destroy()
-        if (this._size) destroyComputed(this._size)
-        super.destroyResources()
+        // CAUTION 每一步都可能执行用户代码（meta 的 destroy 监听者、它们的下游级联、基类钩子里
+        //  本结构自己的 context.onCleanup），任何一步抛错都不能让后面的步骤被跳过（「销毁必须做完」，
+        //  README §6）：曾是顺序执行，values() 的销毁一抛错，entries()/keys()/size 就一直活着、
+        //  一直订阅着本 Map，基类钩子（context.onCleanup、cleanPromise 的 settle）也整个跳过。
+        //  规则与 RxList.destroyResources、静态销毁核心一致：全部做完，第一个错误抛给调用方，
+        //  其后的错误走 reportTeardownError。
+        let failed = false
+        let first: unknown
+        const record = (error: unknown) => {
+            if (failed) {
+                reportTeardownError(error)
+            } else {
+                failed = true
+                first = error
+            }
+        }
+        for (const meta of [this._values, this._entries, this._keys]) {
+            if (!meta) continue
+            try {
+                meta.destroy()
+            } catch (error) {
+                record(error)
+            }
+        }
+        if (this._size) {
+            try {
+                destroyComputed(this._size)
+            } catch (error) {
+                record(error)
+            }
+        }
+        try {
+            super.destroyResources()
+        } catch (error) {
+            record(error)
+        }
+        if (failed) throw first
     }
 }

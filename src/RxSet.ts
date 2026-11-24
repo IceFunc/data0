@@ -2,7 +2,7 @@ import {ApplyPatchType, CallbacksType, computed, Computed, destroyComputed, Dirt
 import {Atom} from "./atom.js";
 import {ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {ReactiveEffect} from "./reactiveEffect.js";
+import {ReactiveEffect, reportTeardownError} from "./reactiveEffect.js";
 import {toProtocolPayload, warn} from "./util.js";
 import {RxList} from "./RxList";
 /**
@@ -415,8 +415,32 @@ export class RxSet<T> extends Computed {
      */
     destroyResources() {
         // 只销毁真正创建过的 size（getter 惰性，直接访问会先创建再销毁）
-        if (this._size) destroyComputed(this._size)
-        super.destroyResources()
+        // CAUTION size 的销毁会执行用户代码（它的 destroy 监听者），抛错不能跳过基类钩子
+        //  （本结构自己的 context.onCleanup、cleanPromise 的 settle）：「销毁必须做完」，
+        //  第一个错误抛给调用方，其后的走 reportTeardownError（同 RxList/RxMap.destroyResources）。
+        let failed = false
+        let first: unknown
+        const record = (error: unknown) => {
+            if (failed) {
+                reportTeardownError(error)
+            } else {
+                failed = true
+                first = error
+            }
+        }
+        if (this._size) {
+            try {
+                destroyComputed(this._size)
+            } catch (error) {
+                record(error)
+            }
+        }
+        try {
+            super.destroyResources()
+        } catch (error) {
+            record(error)
+        }
+        if (failed) throw first
     }
 }
 
