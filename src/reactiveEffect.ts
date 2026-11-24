@@ -57,6 +57,21 @@ export function reportTeardownError(error: unknown) {
     console.error('[data0] uncaught error in teardown:', error)
 }
 
+// 被销毁或被取代的 generator（getter 或 applyPatch）不再续跑：库停在它挂起的 yield 处。
+// 它自己的 finally 是它的清理代码（释放锁、关闭连接……），照 JS 放弃迭代器的约定用 return()
+// 关闭它：yield 之后的函数体不再执行，finally 照常执行。finally 是清理代码：读取不追踪，
+// 抛错没有同步调用方，只上报。
+function closeAbandonedGenerator(generator: Generator<any, any, any>) {
+    const isolated = isolateTeardown()
+    try {
+        generator.return(undefined)
+    } catch (error) {
+        reportTeardownError(error)
+    } finally {
+        if (isolated) notifier.resetTracking()
+    }
+}
+
 // CAUTION 子 effect 的 destroy() 覆写在走到静态核心之前抛错：它仍是 active、仍订阅着依赖、
 //  还留着 parent 与这一代 children 的 index，而这一代数组马上要被 destroyChildren 丢弃——它就成了
 //  活着的孤儿（没有人会再销毁它；之后被单独销毁时还会按陈旧 index 在新 children 上 swap-pop，删掉
@@ -708,7 +723,10 @@ export class ReactiveEffect extends ManualCleanup {
             // CAUTION beforeRun 中如果要返回 false，一定要在所有操作之前，不然后面的 afterRun 执行不到，可能会导致一些内部状态无法重置。
             const implicitContinue = beforeRun(isFirst)
             isFirst = false
-            if(implicitContinue === false) break
+            if(implicitContinue === false) {
+                closeAbandonedGenerator(generator)
+                break
+            }
 
             let value: any
             let done: boolean | undefined

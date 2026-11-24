@@ -1329,3 +1329,107 @@ describe('R-X5 forced recompute × in-flight info, inline (non-batch) entry', ()
         expect(inline).toBe(10)
     })
 })
+
+// review of this PR: stopping an abandoned generator at its yield also skipped its own `finally` (2.16.0 ran it,
+// because it kept running the whole generator after destroy). The library now closes it with return():
+// the body after the yield does not run, the generator's finally does — as teardown code.
+describe('R-F11 an abandoned generator is closed: its finally runs, the rest of its body does not', () => {
+    test('destroyed generator getter', async () => {
+        const src = atom(0)
+        let release!: () => void
+        const ran: string[] = []
+        const c = computed(function* (): Generator<any, any, any> {
+            src()
+            try {
+                yield new Promise<void>(r => { release = r })
+                ran.push('after yield')
+                return 1
+            } finally {
+                ran.push('finally')
+            }
+        } as any)
+        await tick()
+        destroyComputed(c)
+        release()
+        await tick(); await tick()
+        expect(ran).toEqual(['finally'])
+    })
+
+    test('superseded generator getter: the old run is closed, the new one completes', async () => {
+        const src = atom(0)
+        const releases: Array<() => void> = []
+        const ran: string[] = []
+        const c = computed(function* (): Generator<any, any, any> {
+            const v = src()
+            try {
+                yield new Promise<void>(r => { releases.push(r) })
+                ran.push(`after yield ${v}`)
+                return v
+            } finally {
+                ran.push(`finally ${v}`)
+            }
+        } as any)
+        await tick()
+        src(1)
+        await tick()
+        releases.forEach(r => r())
+        await tick(); await tick(); await tick()
+        expect(ran).toEqual(['finally 0', 'after yield 1', 'finally 1'])
+        expect(c.raw).toBe(1)
+        destroyComputed(c)
+    })
+
+    test('destroyed generator patch round', async () => {
+        const src = atom(0)
+        let release!: () => void
+        const ran: string[] = []
+        const c = new Computed(
+            function (this: Computed) {
+                this.manualTrack(src, TrackOpTypes.ATOM, 'value')
+                return null
+            },
+            function* (this: Computed): Generator<any, any, any> {
+                try {
+                    yield new Promise<void>(r => { release = r })
+                    ran.push('after yield')
+                } finally {
+                    ran.push('finally')
+                }
+            } as any,
+        )
+        c.run([], true)
+        src(1)
+        await tick()
+        c.destroy()
+        release()
+        await tick(); await tick()
+        expect(ran).toEqual(['finally'])
+    })
+
+    test('finally is teardown: its reads subscribe nobody, its error is reported', async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const src = atom(0)
+        const read = atom(0)
+        let release!: () => void
+        const c = computed(function* (): Generator<any, any, any> {
+            src()
+            try {
+                yield new Promise<void>(r => { release = r })
+            } finally {
+                read()
+                throw new Error('finally boom')
+            }
+        } as any)
+        await tick()
+        let outerRuns = 0
+        const stop = autorun(() => { outerRuns++; if (src() === 1) destroyComputed(c) }, true)
+        src(1)
+        release()
+        await tick(); await tick()
+        expect(subscribers(read)).toEqual([])
+        read(1)
+        expect(outerRuns).toBe(2)
+        expect(errors.mock.calls.some(args => String(args[0]).includes('teardown') && (args[1] as Error)?.message === 'finally boom')).toBe(true)
+        stop()
+    })
+})
