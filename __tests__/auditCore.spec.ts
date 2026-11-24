@@ -1269,3 +1269,63 @@ describe('R-F9 failure recovery: same rules at every entry, bounded across a fai
         map.destroy()
     })
 })
+
+// review of this PR: the round check in runGeneratorPatch's loop carries weight but no test reached it
+// (reverting it let a superseded round take the infos queued for the new round and drop them: 20 instead of 30).
+describe('R-F10 a superseded generator patch round does not take the next round’s infos', () => {
+    test('superseded round resumes after a forced recompute and a new round', async () => {
+        const src = atom(0)
+        const gates: (() => void)[] = []
+        const c = computed(function (this: any) {
+            this.manualTrack(src, TrackOpTypes.ATOM, 'value')
+            return src.raw * 10
+        }, function* (this: any, data: any, infos: any[]): Generator<any, any, any> {
+            yield new Promise<void>(r => gates.push(r))
+            for (const i of infos) data(data.raw + (i.newValue - i.oldValue) * 10)
+        } as any)
+        src(1)                 // round A suspended (gate 0)
+        await tick()
+        recompute(c, true)     // supersedes A: c = 10
+        src(2)                 // round B suspended (gate 1)
+        await tick()
+        src(3)                 // queued behind B
+        gates[0]()             // the superseded round A resumes
+        await tick(); await tick()
+        for (let k = 0; k < 4; k++) { gates.forEach(g => g()); await tick() }
+        expect(c.raw).toBe(src.raw * 10)
+        destroyComputed(c)
+    })
+})
+
+/**
+ * Known gap, not fixed here (review of this PR): "a recompute owns everything queued for the computed when it
+ * starts" (R-F4) is enforced where the info is queued — the session (batch / digest) and _triggerInfos. When
+ * the source is written outside a batch, the info is not queued yet: it is in flight in the inline dispatch, and
+ * an earlier subscriber that forces a recompute of a delta-consuming patch computed gets the delta applied on top
+ * of the full result. 2.16.0 does the same for both entries (20 / 20); this PR fixed the batch entry only.
+ * Reach: user-written applyPatch that consumes atom deltas, forced from an earlier subscriber of the same source.
+ * A fix needs a per-trigger sequence stamp on the dispatch path, and is only correct if every source writes its
+ * data before dispatching (unverified for RxList's dispatchStructuralThen) — left for a separate change.
+ */
+describe('R-X5 forced recompute × in-flight info, inline (non-batch) entry', () => {
+    const make = () => {
+        const src = atom(0)
+        const box: {c?: any} = {}
+        const forcer = autorun(() => { src(); if (box.c) recompute(box.c, true) }, true)   // subscribed first
+        box.c = computed(function (this: any) {
+            this.manualTrack(src, TrackOpTypes.ATOM, 'value')
+            return src.raw * 10
+        }, function (this: any, data: any, infos: any[]) {
+            for (const i of infos) data(data.raw + (i.newValue - i.oldValue) * 10)
+        })
+        return {src, c: box.c, stop: () => { forcer(); destroyComputed(box.c) }}
+    }
+    test('batch entry equals the full recompute', () => {
+        const y = make(); batch(() => y.src(1)); const batched = y.c.raw; y.stop()
+        expect(batched).toBe(10)
+    })
+    test.fails('inline entry equals the full recompute (known gap: 20)', () => {
+        const x = make(); x.src(1); const inline = x.c.raw; x.stop()
+        expect(inline).toBe(10)
+    })
+})
