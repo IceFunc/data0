@@ -1177,14 +1177,11 @@ export class RxList<T> extends Computed {
                 const fn = slot.fn
                 if (fn) {
                     slot.fn = undefined
-                    // 这里一定在行 effect 自己的 getter 里（追踪打开）：直接关掉再还原，
-                    // 不走 pauseTracking / resetTracking 的栈（每行重算都经过这里）。
-                    const tracking = notifier.shouldTrack
-                    notifier.shouldTrack = false
+                    const isolated = isolateTeardown()
                     try {
                         fn()
                     } finally {
-                        notifier.shouldTrack = tracking
+                        if (isolated) notifier.resetTracking()
                     }
                 }
             }
