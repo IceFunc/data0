@@ -757,31 +757,58 @@ describe('filter: one shared predicate dependency flipping many rows', () => {
 })
 
 describe('map: reactive rows recomputing while a structural change is still pending', () => {
-    test('timings: batch(() => { sharedDep(x); source.push(y) }) at 5k and 40k rows', () => {
-        const run = (n: number) => {
-            const factor = atom(1)
-            const source = new RxList<number>(Array.from({length: n}, (_, i) => i))
-            const mapped = source.map(x => x * factor())
-            const plain = time(() => { factor(2) })
-            const batched = time(() => { batch(() => { factor(3); source.push(1) }) })
-            expect(mapped.data).toEqual(source.data.map(x => x * 3))
-            // deferred map: the structural info waits in the scheduler while every row recomputes
-            const pending: (() => void)[] = []
-            const deferred = source.map(x => x + factor(), {scheduleRecompute: (run: any) => { pending.push(run) }})
-            source.unshift(7)
-            const whilePending = time(() => { factor(4) })
-            pending.splice(0).forEach(r => r())
-            expect(deferred.data).toEqual(source.data.map(x => x + 4))
-            mapped.destroy(); deferred.destroy(); source.destroy()
-            return {plain, batched, whilePending}
+    // Deterministic work counter instead of wall clock: every reactive row's frame is [rowComputed]; turn its
+    // slot 0 into a counting accessor, so each frame probe of the pending-window row locator (indexOf during a
+    // linear scan or a validation, a read while building the position table) counts one.
+    const countFrameProbes = (mapped: RxList<any>) => {
+        const counter = {probes: 0}
+        for (const frame of (mapped as any)._effectFramesArray as unknown[][]) {
+            if (!frame || frame.length === 0 || Object.isFrozen(frame)) continue
+            const effect = frame[0]
+            Object.defineProperty(frame, 0, {get() { counter.probes++; return effect }, configurable: true, enumerable: true})
         }
-        run(1000) // warm up
-        const small = run(5000), large = run(40000)
-        console.log(`MAP PENDING TIMINGS\n  5k: plain atom write ${small.plain.toFixed(1)}ms, batch(atom, push) ${small.batched.toFixed(1)}ms, atom write with a pending info ${small.whilePending.toFixed(1)}ms`
-            + `\n  40k: plain atom write ${large.plain.toFixed(1)}ms, batch(atom, push) ${large.batched.toFixed(1)}ms, atom write with a pending info ${large.whilePending.toFixed(1)}ms`)
-        expect(large.batched / small.batched).toBeLessThan(24)          // linear would be ~8
-        expect(large.whilePending / small.whilePending).toBeLessThan(24)
-    }, 120000)
+        return counter
+    }
+    const n = 2000
+    test('one row recomputing inside the window costs a linear lookup up to that row, no position table', () => {
+        const k = n / 2
+        const marks = Array.from({length: n}, () => atom(0))
+        const source = new RxList<number>(Array.from({length: n}, (_, i) => i))
+        const mapped = source.map(i => i >= 0 ? i + marks[i]() : i)
+        const counter = countFrameProbes(mapped)
+        batch(() => { marks[k](1); source.push(-1) })            // the row re-runs before the push is replayed
+        expect(counter.probes).toBe(k + 1)
+        expect(mapped.data).toEqual(source.data.map(i => i >= 0 ? i + marks[i].raw : i))
+        // deferred map: the push waits in the scheduler while the row re-runs
+        const pending: (() => void)[] = []
+        const deferred = source.map(i => i >= 0 ? i + marks[i]() : i, {scheduleRecompute: (run: any) => { pending.push(run) }})
+        const deferredCounter = countFrameProbes(deferred)
+        source.push(-2)
+        marks[k](2)
+        expect(deferredCounter.probes).toBe(k + 1)
+        pending.splice(0).forEach(run => run())
+        expect(deferred.data).toEqual(source.data.map(i => i >= 0 ? i + marks[i].raw : i))
+        mapped.destroy(); deferred.destroy(); source.destroy()
+    })
+    test('every row recomputing inside the window costs O(n) in total, not O(n^2)', () => {
+        const factor = atom(1)
+        const source = new RxList<number>(Array.from({length: n}, (_, i) => i))
+        const mapped = source.map(x => x * factor())
+        const counter = countFrameProbes(mapped)
+        batch(() => { factor(3); source.push(1) })
+        expect(mapped.data).toEqual(source.data.map(x => x * 3))
+        // one linear lookup (row 0), one table build (n), one validation per later row: ~2n; one findIndex per row would be ~n^2/2
+        expect(counter.probes).toBeLessThanOrEqual(2 * n + 1)
+        const pending: (() => void)[] = []
+        const deferred = source.map(x => x + factor(), {scheduleRecompute: (run: any) => { pending.push(run) }})
+        const deferredCounter = countFrameProbes(deferred)
+        source.unshift(7)
+        factor(4)                                                  // every row re-runs while the unshift is pending
+        expect(deferredCounter.probes).toBeLessThanOrEqual(2 * (n + 1) + 1)
+        pending.splice(0).forEach(run => run())
+        expect(deferred.data).toEqual(source.data.map(x => x + 4))
+        mapped.destroy(); deferred.destroy(); source.destroy()
+    })
     test('a row moved by the running patch is still found at its current position (the position cache validates itself)', () => {
         // deferred map patched outside any digest: writes made by mapFn / cleanups during the patch
         // trigger the surviving rows inline, before and after the row bookkeeping is spliced

@@ -1107,29 +1107,41 @@ export class RxList<T> extends Computed {
 
         // CAUTION 待重放窗口内的行定位（规模债务：共享依赖 × 待重放结构 info）：行级重算
         //  发现本列表还有未重放的结构 info 时，要按行 effect 的身份找到该行的当前
-        //  （pre-patch）位置。旧实现每行对 frame 数组做一次 findIndex——
-        //  `batch(() => { sharedAtom(x); source.push(y) })` 让全部 n 行都走到这里，
-        //  一次 batch 是 O(n²)（4 万行实测秒级，不带 push 的同一次写入是毫秒级）；
-        //  延迟调度的 map 在 info 待重放期间的每次行级重算同理。
-        //  这里把"行 effect → 位置"建成一张表，窗口内的后续行 O(1) 查到。
+        //  （pre-patch）位置。逐行 findIndex 在「窗口内很多行重算」时是 O(n²)——
+        //  `batch(() => { sharedAtom(x); source.push(y) })` 让全部 n 行都走到这里（4 万行
+        //  实测秒级）；延迟调度的 map 在 info 待重放期间的每次行级重算同理。
+        //  而「窗口内只有一行重算」（batch 里改一行的字段再追加一行，最常见的形态）用表
+        //  反而慢一个量级：建表是 n 次 Map 插入，线性查找只到该行为止（4 万行实测 ~16 倍）。
+        //  所以按窗口内的定位次数分档：第一次线性查找（与旧实现逐次相同），第二次起建
+        //  "行 effect → 位置"表，之后 O(1)。一窗口总代价 ≤ 一次线性 + 一次建表。
         //  自校验而不是靠失效点：命中后必须在 frame 数组的该位置上真的找到这个 effect
         //  才采信，否则重建——frame 数组在窗口内本来不变，但 patch 进行中由 mapFn /
         //  清理里的写入内联触发的行级重算会跨过 frame 的搬移，校验让任何漏掉的失效点
-        //  都只是多一次重建而不是写错行。patch / 全量重算的入口与出口清表，
-        //  表不跨窗口常驻。
+        //  都只是多一次重建而不是写错行。patch / 全量重算的入口与出口、销毁时复位
+        //  （resetRowLocator），表与计数不跨窗口常驻。
         let pendingRowPositions: Map<ReactiveEffect, number> | undefined
+        let rowLocatedOnceInWindow = false
+        function resetRowLocator() {
+            pendingRowPositions = undefined
+            rowLocatedOnceInWindow = false
+        }
         function locateRowFrame(list: RxList<U>, row: ReactiveEffect): number {
             const frames = list._effectFramesArray
             if (frames === undefined) return -1
-            const cached = pendingRowPositions?.get(row)
-            if (cached !== undefined) {
-                const frame = frames[cached]
-                if (frame !== undefined && frame.indexOf(row) !== -1) return cached
+            if (pendingRowPositions !== undefined) {
+                const cached = pendingRowPositions.get(row)
+                if (cached !== undefined) {
+                    const frame = frames[cached]
+                    if (frame !== undefined && frame.indexOf(row) !== -1) return cached
+                }
+            } else if (!rowLocatedOnceInWindow) {
+                rowLocatedOnceInWindow = true
+                // 稀疏行：越界 set 的洞 / reorder 物化出的显式 undefined
+                return frames.findIndex(frame => frame !== undefined && frame.indexOf(row) !== -1)
             }
             const positions = pendingRowPositions = new Map<ReactiveEffect, number>()
             for (let i = 0; i < frames.length; i++) {
                 const frame = frames[i]
-                // 稀疏行：越界 set 的洞 / reorder 物化出的显式 undefined
                 if (frame === undefined) continue
                 for (let j = 0; j < frame.length; j++) positions.set(frame[j]!, i)
             }
@@ -1246,7 +1258,7 @@ export class RxList<T> extends Computed {
                 // 全量重算按终态建行，下标恒在界内；复位上一轮 patch 回退时留下的越界标记，
                 // 否则重建出的行会被当成"越界行"而保持惰性（永久失去响应）。
                 indexAtomOutOfRange = false
-                pendingRowPositions = undefined
+                resetRowLocator()
 
                 const result: U[] = []
                 const sourceData = source.data
@@ -1288,7 +1300,7 @@ export class RxList<T> extends Computed {
                 //  数据本身的重放（值来自 argv/newValue，位置对本列表顺序重放）不受影响，
                 //  因此只有真正使用 index atom 的 map 需要回退全量重算。
                 // 待重放窗口到此结束（见 locateRowFrame）
-                pendingRowPositions = undefined
+                resetRowLocator()
                 if (triggerInfos.length > 1 && addedAtomIndexesDep) return false
                 const hadIndexAtomsAtPatchStart = addedAtomIndexesDep
                 indexAtomOutOfRange = false
@@ -1450,7 +1462,7 @@ export class RxList<T> extends Computed {
                     return false
                 }
                 // patch 进行中内联触发的行级重算可能又建了一张表（见 locateRowFrame）
-                pendingRowPositions = undefined
+                resetRowLocator()
                 options?.afterPatch?.(triggerInfos)
                 if (__DEV__) {
                     // dev 不变量：行级记账结构必须与数据严格等长对齐。
@@ -1466,7 +1478,7 @@ export class RxList<T> extends Computed {
                 onDestroy(this: RxList<U>)  {
                     itemProbe?.destroy()
                     itemProbe = undefined
-                    pendingRowPositions = undefined
+                    resetRowLocator()
                     if (addedAtomIndexesDep) {
                         source.removeAtomIndexesDep()
                     }
