@@ -184,6 +184,79 @@ describe('map options.onCleanup: exactly once per value that leaves the list, on
     })
 })
 
+describe('map options.onCleanup on a row recompute: the replaced value is cleaned whatever happens around the write', () => {
+    afterEach(() => { vi.restoreAllMocks() })
+    const teardownReports = (spy: ReturnType<typeof vi.spyOn>) => spy.mock.calls
+        .filter(call => call[0] === '[data0] uncaught error in teardown:')
+        .map(call => (call[1] as Error).message)
+    // fresh token per mapFn call: every token that is not in the list must have been cleaned exactly once
+    const setup = (onCleanupThrowsFor?: string) => {
+        const n = atom(1)
+        const source = new RxList(['x', 'y'])
+        const live = new Set<string>()
+        let cleanedTwice = 0
+        const mapped = source.map(s => { const v = `${s}${n()}`; live.add(v); return v }, {
+            onCleanup: v => {
+                if (!live.delete(v)) cleanedTwice++
+                if (v === onCleanupThrowsFor) throw new Error(`cleanup ${v}`)
+            },
+        })
+        const leaked = () => [...live].filter(v => !mapped.data.includes(v))
+        return {n, source, mapped, live, leaked, cleanedTwice: () => cleanedTwice}
+    }
+    test('a downstream subscriber that throws during the write (non-batch write: the row writes inline)', () => {
+        const reported = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const {n, mapped, live, leaked, cleanedTwice} = setup()
+        let armed = true
+        const stop = onChange(mapped, () => { if (armed) { armed = false; throw new Error('downstream') } })
+        expect(() => n(2)).toThrow('downstream')
+        stop()
+        expect(mapped.data).toEqual(['x2', 'y2'])
+        expect(leaked()).toEqual([])
+        expect(teardownReports(reported)).toEqual([])
+        mapped.destroy()
+        expect([...live]).toEqual([])
+        expect(cleanedTwice()).toBe(0)
+    })
+    test('the write and the cleanup both throw: the write error is thrown, the cleanup error reported', () => {
+        const reported = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        const {n, mapped, leaked} = setup('x1')
+        let armed = true
+        const stop = onChange(mapped, () => { if (armed) { armed = false; throw new Error('downstream') } })
+        expect(() => n(2)).toThrow('downstream')
+        stop()
+        expect(leaked()).toEqual([])
+        expect(teardownReports(reported)).toEqual(['cleanup x1'])
+        mapped.destroy()
+    })
+    test('the map is destroyed while a row re-runs (from that row\'s context cleanup): no cleanup with a value mapFn never produced', () => {
+        const n = atom(0)
+        const source = new RxList([1, 2])
+        const received: unknown[] = []
+        let mapped!: RxList<{x: number}>
+        mapped = source.map((x, _i, {onCleanup}) => {
+            const v = n()
+            onCleanup(() => { if (x === 1 && v === 0) mapped.destroy() })
+            return {x}
+        }, {onCleanup: value => { received.push(value); void value.x }})   // dereferences, like a real disposer
+        expect(() => n(1)).not.toThrow()
+        expect(mapped.active).toBe(false)
+        expect(received.includes(undefined)).toBe(false)
+        expect(received.map(value => (value as {x: number}).x)).toEqual([1, 2])   // the destroy cleaned both rows once
+    })
+    test('an explicit undefined that leaves the list is still cleaned (undefined is a legal mapped value)', () => {
+        const n = atom(0)
+        const source = new RxList([1])
+        const cleaned: unknown[] = []
+        const mapped = source.map(x => (n() === 0 ? undefined : x), {onCleanup: value => { cleaned.push(value) }})
+        n(1)
+        expect(mapped.data).toEqual([1])
+        expect(cleaned).toEqual([undefined])
+        mapped.destroy()
+        expect(cleaned).toEqual([undefined, 1])
+    })
+})
+
 describe('sortSelf: undefined elements follow Array#sort (never passed to the comparator, always last)', () => {
     test('differential against Array#sort: random lists with undefined and duplicates, comparator never sees undefined', () => {
         const rand = mulberry32(20261123)

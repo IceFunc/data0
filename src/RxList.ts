@@ -1073,16 +1073,39 @@ export class RxList<T> extends Computed {
         //    离场，此刻销毁它等于销毁仍在列表里的行。
         //  - 与行级 context cleanup 同款隔离：它跑在行 effect 自己的 getter 里，读取
         //    不得建立依赖（README「清理不建立依赖」）。
+        //  - 旧值在 set **之前**从 list.data 取，清理放在 set 之后、无论 set 是否抛错都执行：
+        //    set 会在自己的 session 里同步 digest 下游订阅者，订阅者抛错时 set 已写入、旧值
+        //    已离场——清理若排在 set 的正常返回之后就被跳过，旧值永久泄漏（destroy 也不会
+        //    再清理它）。两段都抛错时按 keepFirstTeardownError：先抛 set 的错误，清理的上报。
+        //  - 不能拿 set 的返回值当旧值：已销毁实例的 set 是返回 `undefined as T` 的 no-op，
+        //    undefined 又是合法的映射值——行在自己的重算里销毁了整个 map（清理或 mapFn 里
+        //    destroy）时，旧实现会以 undefined 调用 options.onCleanup（用户回调解引用即
+        //    TypeError，抛给写依赖的人）。已销毁时直接返回：旧值已由销毁清理过。
         //  map 级函数而不是逐行闭包：响应式行不为它多付一个闭包。
         function replaceRowValue(list: RxList<U>, rowIndex: number, nextValue: U) {
-            const previousValue = list.set(rowIndex, nextValue)
-            if (options?.onCleanup === undefined || Object.is(previousValue, nextValue)) return
-            const isolated = isolateTeardown()
-            try {
-                options.onCleanup(previousValue)
-            } finally {
-                if (isolated) notifier.resetTracking()
+            if (!list.active) return
+            if (options?.onCleanup === undefined) {
+                list.set(rowIndex, nextValue)
+                return
             }
+            const previousValue = list.data[rowIndex]
+            let first: unknown = NO_TEARDOWN_ERROR
+            try {
+                list.set(rowIndex, nextValue)
+            } catch (error) {
+                first = error
+            }
+            if (!Object.is(previousValue, nextValue)) {
+                const isolated = isolateTeardown()
+                try {
+                    options.onCleanup(previousValue)
+                } catch (error) {
+                    first = keepFirstTeardownError(first, error)
+                } finally {
+                    if (isolated) notifier.resetTracking()
+                }
+            }
+            if (first !== NO_TEARDOWN_ERROR) throw first
         }
 
         // CAUTION 待重放窗口内的行定位（规模债务：共享依赖 × 待重放结构 info）：行级重算
