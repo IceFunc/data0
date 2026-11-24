@@ -77,11 +77,9 @@ export class RxSet<T> extends Computed {
             warn('mutating a destroyed RxSet is a no-op')
             return this
         }
-        // CAUTION -0 在写入口归一化为 +0（与原生 Set#add 一致）：容器里存的是 +0，而
-        //  triggerInfo 曾原样带着调用方的 -0——toList 等按 argv 重放的派生结构把 -0 推进
-        //  列表，与容器本身、与全量重算（[...set]）在 Object.is 下分叉（列表元素身份按
-        //  Object.is，README「RxList 参数契约」）。载荷里的成员必须就是容器里存的那个值。
-        if ((value as unknown) === 0) value = 0 as unknown as T
+        // CAUTION 载荷透传调用方的原始成员（含 -0）：triggerInfo/argv 是外部协议，不在写入口
+        //  改写（AGENTS「内部消费者应独立归一化」）。原生 Set 存的是 +0，按 argv 重放出成员
+        //  序列的内部消费者（toList）自行归一化。
         if (!this.data.has(value)) {
             this.data.add(value)
             this.trigger(this, TriggerOpTypes.ADD, { key: value, newValue: value})
@@ -98,8 +96,7 @@ export class RxSet<T> extends Computed {
             warn('mutating a destroyed RxSet is a no-op')
             return this
         }
-        // -0 归一化为 +0：载荷与容器里存的值一致（理由见 add）
-        if ((value as unknown) === 0) value = 0 as unknown as T
+        // 载荷透传原始成员（理由见 add）
         if (this.data.has(value)) {
             this.data.delete(value)
             this.trigger(this, TriggerOpTypes.DELETE, { key: value, argv: [value]})
@@ -366,7 +363,10 @@ export class RxSet<T> extends Computed {
                     }
 
                     newItems.forEach(x => {
-                        this.push(x)
+                        // CAUTION 载荷是调用方的原始成员（-0 原样透传），列表里放 Set 实际存的
+                        //  +0：否则增量结果持有 -0、全量重算 [...set] 持有 +0，在 Object.is 下分叉
+                        //  （README §3/§4）。删除侧的 SameValueZero 查找对 ±0 天然成立。
+                        this.push((x as unknown) === 0 ? 0 as unknown as T : x)
                     })
 
                     deletedItems.forEach(x => {

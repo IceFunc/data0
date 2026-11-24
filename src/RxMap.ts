@@ -21,6 +21,15 @@ type PlainObjectType = {
     [key: string]: any
 }
 /**
+ * argv 里的 key → 容器里实际存的 key。原生 Map 把 -0 存成 +0，而载荷按协议透传调用方的
+ * 原始参数（AGENTS「argv 透传，内部消费者独立归一化」）；按 argv 重放出 key 序列的内部
+ * 消费者必须经它，否则增量结果持有 -0、全量重算（[...map.keys()]）持有 +0，在 Object.is
+ * 下分叉（README §3「batch 退出后 ≡ 终态全量重算」、§4「元素身份按 Object.is」）。
+ */
+function normalizeKey<K>(key: K): K {
+    return (key as unknown) === 0 ? 0 as unknown as K : key
+}
+/**
  * values()/entries() 的共享构造：直接消费源 Map 的 METHOD info 的 patch 列表。
  * （模块级函数而不是原型方法：内部设施，不进 RxMap 的公开成员面。）
  *
@@ -74,7 +83,8 @@ function createEntryList<K, V, R>(source: RxMap<K, V>, snapshot: () => R[], proj
         function applyPatch(this: RxList<R>, _data: Atom<R[]>, triggerInfos) {
             for (const info of triggerInfos) {
                 if (info.method === 'set') {
-                    const [key, value] = info.argv as [K, V]
+                    const key = normalizeKey(info.argv![0] as K)
+                    const value = info.argv![1] as V
                     const [hasValue] = info.methodResult as [boolean, V]
                     if (!hasValue) {
                         if (hints !== undefined) hints.set(key, order.length + frontRemoved)
@@ -87,6 +97,7 @@ function createEntryList<K, V, R>(source: RxMap<K, V>, snapshot: () => R[], proj
                         this.set(index, project(key, value))
                     }
                 } else if (info.method === 'delete') {
+                    // 原始 key（可能是 -0）可直接定位：hints（Map）与 sameKey（===）对 ±0 都成立
                     const key = info.argv![0] as K
                     const index = locate(key)
                     if (index === -1) return false
@@ -180,11 +191,9 @@ export class RxMap<K, V> extends Computed{
             warn('mutating a destroyed RxMap is a no-op')
             return
         }
-        // CAUTION key 的 -0 在写入口归一化为 +0（与原生 Map#set 一致）：容器里存的 key 是
-        //  +0，而 triggerInfo 曾原样带着调用方的 -0——keys()/entries() 按 argv 重放时把 -0
-        //  推进列表，与容器本身、与全量重算（[...map.keys()]）在 Object.is 下分叉。
-        //  只归一化 key：value 的 0/-0 是可区分的值（见下方 Object.is 判等门）。
-        if ((key as unknown) === 0) key = 0 as unknown as K
+        // CAUTION 载荷透传调用方的原始 key（含 -0）：triggerInfo/argv 是 axii/axle 消费的外部
+        //  协议，不在写入口改写（AGENTS「内部消费者应独立归一化」）。容器（原生 Map）存的是 +0，
+        //  按 argv 重放的内部消费者（keys()/values()/entries()）各自用 normalizeKey 归一化。
         const hasValue = this.data.has(key)
         const oldValue = this.data.get(key)
         this.data.set(key, value)
@@ -209,8 +218,7 @@ export class RxMap<K, V> extends Computed{
             warn('mutating a destroyed RxMap is a no-op')
             return
         }
-        // key 的 -0 归一化为 +0：载荷与容器里存的 key 一致（理由见 set）
-        if ((key as unknown) === 0) key = 0 as unknown as K
+        // 载荷透传原始 key（理由见 set）
         const hasValue = this.data.has(key)
         let oldValue:V|undefined
         if (hasValue) {
@@ -292,7 +300,8 @@ export class RxMap<K, V> extends Computed{
                             } else if (info.method === 'set') {
                                 const [hasValue] = info.methodResult as [boolean, V]
                                 if (!hasValue) {
-                                    this.push(info.argv![0]! as K)
+                                    // 载荷是原始 key（可能是 -0），列表里放容器存的 key
+                                    this.push(normalizeKey(info.argv![0] as K))
                                 }
                             } else if(info.method === 'delete') {
                                 // CAUTION SameValueZero 查找：Map 的 key 语义支持 NaN，

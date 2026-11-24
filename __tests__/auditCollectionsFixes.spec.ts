@@ -853,8 +853,11 @@ describe('F8 regression: toSet removal cost and correctness', () => {
 // ---------------------------------------------------------------------------
 describe('M3 regression: -0 and +0 are one member / one key everywhere', () => {
     const isPlusZero = (x: unknown) => Object.is(x, 0)
+    // trigger payloads carry what the caller passed (AGENTS: argv is an external protocol, internal
+    // consumers normalize); the incremental structures hold the stored +0
+    const zeroSign = (x: unknown) => Object.is(x, -0) ? '-0' : String(x)
 
-    test('RxSet: add / has / delete with -0 and +0, incremental structures hold the stored +0', () => {
+    test('RxSet: add / has / delete with -0 and +0, incremental structures hold the stored +0, payloads stay raw', () => {
         const s = new RxSet<number>([])
         const other = new RxSet<number>([5])
         const list = s.toList()
@@ -884,8 +887,8 @@ describe('M3 regression: -0 and +0 are one member / one key everywhere', () => {
         expect(s.data.size).toBe(0)
         expect(list.data).toEqual([])
         stop()
-        expect(payloads.length).toBe(6)                   // add, delete, add, delete, add, delete
-        expect(payloads.every(isPlusZero)).toBe(true)     // the payload carries the stored value
+        // add(-0), delete(-0), add(0), delete(0), add(-0), delete(0): the payload is the caller's argument
+        expect(payloads.map(zeroSign)).toEqual(['-0', '-0', '0', '0', '-0', '0'])
         destroyComputed(hasZero); destroyComputed(hasMinusZero)
     })
 
@@ -900,7 +903,7 @@ describe('M3 regression: -0 and +0 are one member / one key everywhere', () => {
         expect(list.data.length).toBe(2)
     })
 
-    test('RxMap: set / get / delete with -0 and +0 keys, keys()/entries() hold the stored +0', () => {
+    test('RxMap: set / get / delete with -0 and +0 keys, keys()/entries() hold the stored +0, payloads stay raw', () => {
         const m = new RxMap<number, string>([])
         const keys = m.keys(), entries = m.entries(), values = m.values()
         const viaMinusZero = computed(() => m.get(-0))
@@ -927,8 +930,8 @@ describe('M3 regression: -0 and +0 are one member / one key everywhere', () => {
         m.set(0, 'd'); m.delete(0); m.set(-0, 'e'); m.delete(0)
         expect([keys.data, values.data]).toEqual([[], []])
         stop()
-        expect(payloadKeys.length).toBe(8)
-        expect(payloadKeys.every(isPlusZero)).toBe(true)
+        // set(-0) set(0) set(-0) delete(-0) set(0) delete(0) set(-0) delete(0): raw caller arguments
+        expect(payloadKeys.map(zeroSign)).toEqual(['-0', '0', '-0', '-0', '0', '0', '-0', '0'])
         destroyComputed(viaMinusZero); destroyComputed(viaZero)
     })
 
