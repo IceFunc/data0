@@ -53,6 +53,20 @@ function reportTeardownError(error: unknown) {
     console.error('[data0] uncaught error in teardown:', error)
 }
 
+// CAUTION 子 effect 的 destroy() 覆写在走到静态核心之前抛错：它仍是 active、仍订阅着依赖、
+//  还留着 parent 与这一代 children 的 index，而这一代数组马上要被 destroyChildren 丢弃——它就成了
+//  活着的孤儿（没有人会再销毁它；之后被单独销毁时还会按陈旧 index 在新 children 上 swap-pop，删掉
+//  活着的兄弟）。绕过已经抛过错的覆写，用静态核心把它销毁完；fromParent：父 effect 自己清空
+//  children。覆写在 super.destroy() 之后才抛错时它已经 inactive，这里什么都不做。
+function finishChildAfterError(child: ReactiveEffect | undefined) {
+    if (child === undefined || !child.active) return
+    try {
+        ReactiveEffect.destroy(child, true)
+    } catch (error) {
+        reportTeardownError(error)
+    }
+}
+
 export class ReactiveEffect extends ManualCleanup {
     static activeScopes: ReactiveEffect[] = []
     public active: boolean
@@ -96,7 +110,10 @@ export class ReactiveEffect extends ManualCleanup {
         // CAUTION 快路径：没有子 effect、没有任何监听者、也没有子类资源钩子的 effect——渲染框架里
         //  的属性 / 文本绑定几乎都是这样——销毁时不会执行任何用户代码：不需要隔离，不可能抛错，
         //  也没有 destroy 事件要派发。摘掉订阅、离开父 effect 就结束。这是列表卸载时每个绑定都走的路径。
-        if (effect._children === undefined && effect._eventToCallbacks === undefined && effect.destroyResources === noDestroyResources) {
+        //  销毁协议里可覆写的方法（cleanup / destroyChildren / dispatch）被子类覆写时，覆写就是用户代码，
+        //  走下面的完整路径：照 2.16.0 的协议调用它们，并且隔离其中的读取。
+        if (effect._children === undefined && effect._eventToCallbacks === undefined && effect.destroyResources === noDestroyResources
+            && effect.cleanup === baseCleanup && effect.destroyChildren === baseDestroyChildren && effect.dispatch === baseDispatch) {
             effect.cleanup()
             ReactiveEffect.unlinkFromParent(effect, fromParent)
             return
@@ -187,7 +204,13 @@ export class ReactiveEffect extends ManualCleanup {
     // destroy 监听者是清理代码（onDestroy 回调、派生结构挂的级联销毁）：一个抛错不能让排在后面的
     // 收不到通知——它们要释放的东西就永久留下了。全部通知完再抛出第一个错误，其余的上报。
     // 绝大多数 effect 没有监听者，直接返回。
+    // 覆写了 dispatch 的子类照旧经 dispatch('destroy') 收到事件（2.16.0 的协议），监听者之间的
+    // 错误隔离由覆写自己负责。
     private static dispatchDestroy(effect: ReactiveEffect) {
+        if (effect.dispatch !== baseDispatch) {
+            effect.dispatch('destroy')
+            return
+        }
         const callbacks = effect._eventToCallbacks?.get('destroy')
         if (callbacks === undefined) return
         let failed = false
@@ -319,11 +342,13 @@ export class ReactiveEffect extends ManualCleanup {
                     children[i]?.destroy(false, true)
                 }
             } catch (error) {
+                finishChildAfterError(children[i])
                 for (i++; i < children.length; i++) {
                     try {
                         children[i]?.destroy(false, true)
                     } catch (laterError) {
                         reportTeardownError(laterError)
+                        finishChildAfterError(children[i])
                     }
                 }
                 throw error
@@ -411,7 +436,8 @@ export class ReactiveEffect extends ManualCleanup {
         }
 
         // 没有子 effect 就没有清理要跑、不会抛错：最热的路径（绑定类 effect 的重跑）不进 try。
-        if (this._children === undefined) return
+        //  覆写了 destroyChildren 的子类照 2.16.0 的协议每轮都调用它。
+        if (this._children === undefined && this.destroyChildren === baseDestroyChildren) return
         try {
             this.destroyChildren()
         } catch (err) {
@@ -426,7 +452,14 @@ export class ReactiveEffect extends ManualCleanup {
             } else if (previousDeps !== undefined) {
                 restoreEffectDeps(this, previousDeps)
             }
-            this.completeTracking(false, isAsync)
+            // 清理里登记的延迟销毁（例如子 effect 的清理销毁了正在重算的本 effect）在这里执行，
+            // 它抛出的是第二个错误：第一个错误抛给调用方，这个只上报。completeTracking 先出栈、
+            // 复原深度再执行延迟销毁，抛错时栈已经复原。
+            try {
+                this.completeTracking(false, isAsync)
+            } catch (destroyError) {
+                reportTeardownError(destroyError)
+            }
             throw err
         }
     }
@@ -450,6 +483,13 @@ export class ReactiveEffect extends ManualCleanup {
 
     completeTracking(isLast = false, isAsync = this.isAsync) {
         if (!isAsync) {
+            // CAUTION dev 不变量：同步的 completeTracking 必须与一次仍在栈上的 prepareTracking 配对。
+            //  prepareTracking 失败时自己撤销（见其说明），调用方若把它放在自己的 try 里、在 finally
+            //  里再 completeTracking，就会多完成一次：effectTrackDepth 变成负数、trackOpBit 错位，
+            //  之后整个进程的依赖标记都是错的，而没有任何其他地方会报错。生产构建下代码被剔除。
+            if (__DEV__) {
+                assert(ReactiveEffect.activeScopes.lastIndexOf(this) !== -1, 'completeTracking without a matching prepareTracking on the scope stack (prepareTracking undoes itself when it throws: call it outside your try)')
+            }
             if (this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) {
                 finalizeDepMarkers(this)
             }
@@ -664,6 +704,10 @@ export class ReactiveEffect extends ManualCleanup {
 // 恒定默认值放在原型上：实例只在真正改写时才产生自有属性（见类顶部 declare 说明）
 // 基类的空钩子：销毁快路径用它判断「这个 effect 没有子类资源要释放」
 const noDestroyResources = ReactiveEffect.prototype.destroyResources
+// 销毁协议里其余可覆写的方法：被子类覆写时，快路径与 prepareTracking 的提前返回都不适用
+const baseCleanup = ReactiveEffect.prototype.cleanup
+const baseDestroyChildren = ReactiveEffect.prototype.destroyChildren
+const baseDispatch = ReactiveEffect.prototype.dispatch
 ReactiveEffect.prototype.isRunningAsync = false
 ReactiveEffect.prototype._pendingDestroy = 0
 ReactiveEffect.prototype.useDepMarker = true

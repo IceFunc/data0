@@ -632,3 +632,156 @@ describe('a bare effect in full cleanup mode keeps its dependencies', () => {
         expect(runs).toBe(1)
     })
 })
+
+/**
+ * 子 effect 的 destroy() 覆写在走到静态核心之前就抛错（review 发现，本 PR 的 c3d3312 引入）。
+ *
+ * destroyChildren 无论成败都丢弃这一代 children 数组。覆写在 super.destroy() 之前抛错时，
+ * 这个子 effect 仍是 active、仍订阅着依赖，还留着 parent 与旧数组的 index——成为活着的孤儿：
+ * 没有人会再销毁它；之后被单独销毁时按陈旧 index 在新 children 上 swap-pop，删掉活着的兄弟
+ * （与「清理里创建的 effect 弄坏 children 记账」同一缺陷类）。
+ * 等价类：{覆写在 super 之前抛错} × {第一个抛错者 / 兄弟先抛错之后的续销毁循环}。
+ */
+describe('a child whose destroy() override throws before reaching the core', () => {
+    class OverridingComputed extends Computed {
+        throwOnce = false
+        destroy(ignoreChildren = false, fromParent = false) {
+            if (this.throwOnce) {
+                this.throwOnce = false
+                throw new Error('override teardown')
+            }
+            super.destroy(ignoreChildren, fromParent)
+        }
+    }
+
+    function setup(withThrowingFirstSibling = false) {
+        const tick = atom(0)
+        const depK = atom(0)
+        const depS = atom(0)
+        const generations: Array<{k: OverridingComputed, s: Computed}> = []
+        let kRuns = 0
+        let firstThrows = false
+        let parent!: ReactiveEffect
+        const stop = autorun(() => {
+            tick()
+            parent = ReactiveEffect.activeScopes[ReactiveEffect.activeScopes.length - 1]
+            if (withThrowingFirstSibling) {
+                autorun(({onCleanup}) => { onCleanup(() => { if (firstThrows) throw new Error('first sibling') }) }, true)
+            }
+            const k = new OverridingComputed(() => { depK(); kRuns++ }, undefined, true)
+            k.run([], true)
+            const s = new Computed(() => { depS() }, undefined, true)
+            s.run([], true)
+            generations.push({k, s})
+        }, true)
+        return {
+            tick, depK, depS, generations, stop,
+            parent: () => parent,
+            kRuns: () => kRuns,
+            armFirstSibling: (value: boolean) => { firstThrows = value },
+        }
+    }
+
+    test('the child is destroyed anyway: unsubscribed, not re-run, the error reaches the caller', () => {
+        const {tick, depK, generations, stop, kRuns} = setup()
+        const k0 = generations[0].k
+        k0.throwOnce = true
+        expect(() => tick(1)).toThrow('override teardown')
+        expect(k0.active).toBe(false)
+        expect(k0.parent).toBeUndefined()
+        // 父 effect 这一轮在 prepareTracking 就失败了，没有新一代：k0 不能再跑
+        let runsBefore = kRuns()
+        depK(1)
+        expect(kRuns() - runsBefore).toBe(0)
+        // 下一轮重算产生新一代，只有它响应
+        tick(2)
+        runsBefore = kRuns()
+        depK(2)
+        expect(kRuns() - runsBefore).toBe(1)
+        stop()
+        expect(subscribers(depK)).toEqual([])
+    })
+
+    test('destroying it again later does not evict a live sibling of the new generation', () => {
+        const {tick, depK, depS, generations, stop, parent} = setup()
+        const k0 = generations[0].k
+        k0.throwOnce = true
+        expect(() => tick(1)).toThrow('override teardown')
+        tick(2)
+        const latest = generations[generations.length - 1]
+        k0.destroy()
+        expect((parent() as any)._children).toContain(latest.k)
+        expect((parent() as any)._children).toContain(latest.s)
+        stop()
+        expect(latest.k.active).toBe(false)
+        expect(latest.s.active).toBe(false)
+        expect(subscribers(depK)).toEqual([])
+        expect(subscribers(depS)).toEqual([])
+    })
+
+    test('after an earlier sibling threw: the error is reported and the child is still destroyed', () => {
+        const {tick, depK, generations, stop, armFirstSibling} = setup(true)
+        armFirstSibling(true)
+        generations[0].k.throwOnce = true
+        expect(() => tick(1)).toThrow('first sibling')
+        armFirstSibling(false)
+        expect(generations[0].k.active).toBe(false)
+        expect(errorLog.map(args => (args[1] as Error).message)).toEqual(['override teardown'])
+        stop()
+        expect(subscribers(depK)).toEqual([])
+    })
+})
+
+describe('error precedence when the teardown fails in more than one place', () => {
+    test('a host whose own cleanup and a child both throw: the host error wins, every listener is notified', () => {
+        const tick = atom(0)
+        const notified: string[] = []
+        const host = new Computed(function (this: Computed, {onCleanup}: any) {
+            onCleanup(() => { throw new Error('host cleanup') })
+            autorun(({onCleanup}) => { tick(); onCleanup(() => { throw new Error('child cleanup') }) }, true)
+            autorun(({onCleanup}) => { tick(); onCleanup(() => { notified.push('sibling cleanup') }) }, true)
+        }, undefined, true)
+        host.run([], true)
+        host.on('destroy', () => { notified.push('host listener 1'); throw new Error('host listener') })
+        host.on('destroy', () => { notified.push('host listener 2') })
+        expect(subscribers(tick)).toHaveLength(2)
+
+        expect(() => host.destroy()).toThrow('host cleanup')
+        expect(host.active).toBe(false)
+        expect(subscribers(tick)).toEqual([])
+        expect(notified).toEqual(['sibling cleanup', 'host listener 1', 'host listener 2'])
+        expect(errorLog.map(args => (args[1] as Error).message)).toEqual(['child cleanup', 'host listener'])
+    })
+
+    test('a child cleanup that destroys its re-running parent and throws: its error is not replaced by the parent teardown', () => {
+        const hosts: Array<(dep: Atom<number>, body: () => void) => ReactiveEffect> = [
+            (dep, body) => new LightEffect(() => { dep(); body() }),
+            (dep, body) => {
+                const effect = new Computed(() => { dep(); body() }, undefined, true)
+                effect.run([], true)
+                return effect
+            },
+        ]
+        for (const create of hosts) {
+            errorLog.length = 0
+            const dep = atom(0)
+            let armed = false
+            const parent: ReactiveEffect = create(dep, () => {
+                autorun(({onCleanup}) => {
+                    onCleanup(() => {
+                        if (!armed) return
+                        parent.destroy()
+                        throw new Error('child cleanup')
+                    })
+                }, true)
+            })
+            parent.on('destroy', () => { if (armed) throw new Error('parent destroy listener') })
+            armed = true
+            // 父 effect 的延迟销毁在 prepareTracking 撤销时执行，它的错误是第二个错误
+            expect(() => dep(1)).toThrow('child cleanup')
+            expect(errorLog.map(args => (args[1] as Error).message)).toEqual(['parent destroy listener'])
+            expect(parent.active).toBe(false)
+            expect(subscribers(dep)).toEqual([])
+        }
+    })
+})
