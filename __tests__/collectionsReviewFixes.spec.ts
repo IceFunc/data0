@@ -2,8 +2,8 @@
  * Regression tests for the review of the collection fixes (PR #24, commit 6b52f72 follow-ups).
  * Each describe block belongs to one root cause; every test failed on the tree before its fix.
  */
-import {describe, expect, test} from 'vitest'
-import {batch, onChange, RxList, RxMap, RxSet} from '../src/index'
+import {afterEach, describe, expect, test, vi} from 'vitest'
+import {atom, batch, onChange, RxList, RxMap, RxSet, RxTime} from '../src/index'
 import {Computed} from '../src/computed.js'
 import {ITERATE_KEY} from '../src/notify.js'
 import {TrackOpTypes} from '../src/operations.js'
@@ -66,5 +66,61 @@ describe('-0 keys: raw payloads, normalizing internal consumers', () => {
             expect(derived.data.some(x => Object.is(x, -0)), 'derived key sequence holds -0').toBe(false)
             expect(derived.data.some(x => Object.is(x, 0))).toBe(true)
         }
+    })
+})
+
+// ---------------------------------------------------------------------------
+// RxTime x a Date.now() coarser than the +2 ms wake-up: the wake-up lands in the same clock tick, which the
+// old "clock has not moved -> stop" guard read as a frozen clock, so gt(deadline) stayed false forever
+// ---------------------------------------------------------------------------
+describe('RxTime: wake-up inside the same Date.now() tick re-arms with a bounded back-off', () => {
+    afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
+    const coarseClock = (resolution: number) => {
+        const fakeNow = Date.now.bind(Date)   // the faked Date: advances with the fake timers
+        vi.spyOn(Date, 'now').mockImplementation(() => Math.floor(fakeNow() / resolution) * resolution)
+    }
+
+    test('100 ms clock: deadline(Date.now()) -> gt(deadline) turns true, then no timer is left', () => {
+        vi.useFakeTimers(); vi.setSystemTime(2_000_050)
+        coarseClock(100)
+        const deadline = atom(9_999_999)
+        const t = new RxTime()
+        const expired = t.gt(deadline)
+        deadline(Date.now())                   // "expire now", evaluated exactly at the crossing
+        expect(expired.raw).toBe(false)
+        vi.advanceTimersByTime(200)            // the next 100 ms tick is reached within the back-off
+        expect({expired: expired.raw, pendingTimers: vi.getTimerCount()}).toEqual({expired: true, pendingTimers: 0})
+        t.destroy()
+    })
+
+    test('100 ms clock: a 50 ms timeout gt(Date.now() + 50) turns true on the next tick', () => {
+        vi.useFakeTimers(); vi.setSystemTime(2_000_010)
+        coarseClock(100)
+        const t = new RxTime()
+        const expired = t.gt(Date.now() + 50)
+        vi.advanceTimersByTime(60)             // first wake-up: still inside the same 100 ms tick
+        expect(expired.raw).toBe(false)
+        vi.advanceTimersByTime(200)
+        expect({expired: expired.raw, pendingTimers: vi.getTimerCount()}).toEqual({expired: true, pendingTimers: 0})
+        t.destroy()
+    })
+
+    test('frozen Date: at most 1 + 16 wake-ups, then no timer; destroy mid back-off leaves none', () => {
+        vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']})
+        vi.spyOn(Date, 'now').mockReturnValue(2_000_000)
+        const t = new RxTime()
+        const expired = t.gt(2_000_000)
+        let wakeUps = 0
+        while (vi.getTimerCount() > 0 && wakeUps < 100) { vi.advanceTimersToNextTimer(); wakeUps++ }
+        expect(wakeUps).toBe(17)
+        expect(expired.raw).toBe(false)
+        t.destroy()
+
+        const t2 = new RxTime()
+        t2.gt(2_000_000)
+        vi.advanceTimersToNextTimer(); vi.advanceTimersToNextTimer()   // in the middle of the back-off
+        expect(vi.getTimerCount()).toBe(1)
+        t2.destroy()
+        expect(vi.getTimerCount()).toBe(0)
     })
 })

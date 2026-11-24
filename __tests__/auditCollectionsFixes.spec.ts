@@ -402,13 +402,13 @@ describe('F3/F5 regression: RxTime timer accounting (fake timers)', () => {
         t.destroy()
     })
 
-    test('clock standing still (timers faked, Date frozen): one wake-up, no re-arm loop', () => {
+    test('clock standing still (timers faked, Date frozen): bounded back-off re-arms, then no timer', () => {
         vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']})
         vi.spyOn(Date, 'now').mockReturnValue(T0)
         const a = new RxTime(); const later = a.gt(T0 + 1000)
         const b = new RxTime(); const boundary = b.gt(T0)
         expect(vi.getTimerCount()).toBe(2)
-        vi.runAllTimers()                          // would abort with "infinite loop" if the wake-ups re-armed
+        vi.runAllTimers()                          // would abort with "infinite loop" if the wake-ups re-armed without bound
         expect(vi.getTimerCount()).toBe(0)
         expect([later.raw, boundary.raw]).toEqual([false, false])   // the clock never moved
         a.destroy(); b.destroy()

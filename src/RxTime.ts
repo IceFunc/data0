@@ -15,6 +15,10 @@ type Operation = {
 // setTimeout 的延时上限（32 位有符号整数，约 24.8 天）。超过它 Node 打
 // TimeoutOverflowWarning 并改成 1ms、浏览器按 0 处理——都是立即触发的虚假唤醒。
 const MAX_TIMEOUT = 2 ** 31 - 1
+// 唤醒时 Date.now() 还停在排定时的刻度上（粗精度时钟）时的退避续排：延时 2^n ms、上限 1s，
+// 连续 16 次（累计约 8s）仍在同一刻度才放弃——那只能是被冻结的时钟（见 resolve 的说明第 4 条）。
+const MAX_STALLS = 16
+const MAX_STALL_DELAY = 1000
 /**
  * @category Basic
  */
@@ -128,10 +132,13 @@ export class RxTime {
         //     旧结果，之后再无唤醒，到点永不翻转。
         //  3. 唤醒时时钟还没越过越点（延时被钳、系统时钟被回拨）就按剩余时间续排——旧实现
         //     只唤醒一次，没越点也不再管。
-        //  4. 唯一不续排的情形是时钟自排定以来纹丝未动（firedAt === armedAt，例如只 fake 了
-        //     timer 没 fake Date）：再排只会原地空转（runAllTimers 下是死循环），时钟不走
-        //     越点也到不了。
-        const arm = (coefficient: number, constant: number, armedAt: number, armedGeneration: number) => {
+        //  4. 唤醒时 Date.now() 与排定时相同（firedAt === armedAt）不等于「时钟冻结」：
+        //     Date.now() 的精度可能粗于 +2ms（精度被刻意降低的运行环境、粗粒度的平台时钟），
+        //     唤醒落在同一个刻度里，曾因此直接放弃续排——恰在期限求值的 gt(deadline) 又永远
+        //     是 false（上面第 1 条要修的症状）。改为有界退避续排：延时 2、4、8…ms（上限
+        //     1s），连续 MAX_STALLS 次读到同一刻度才放弃。真冻结的时钟（只 fake 了 timer 没
+        //     fake Date）因此至多多排 MAX_STALLS 个 timer 就停，runAllTimers 不会死循环。
+        const arm = (coefficient: number, constant: number, armedAt: number, armedGeneration: number, stalls = 0) => {
             // 如果还有 timeout，说明没到计算时间，计算中的参数变化了引发的重新计算，先清空
             if (this.timeoutId) {
                 clearTimeout(this.timeoutId)
@@ -145,7 +152,8 @@ export class RxTime {
             if (!Number.isFinite(nextChangeTimestamp) || nextChangeTimestamp < armedAt) return
             // CAUTION 这里的 +2 非常重要，因为系数常数可能有浮点，或者 Date.now() 算出来的时候可能并没有达到真正的变化时间。
             //  所以这里使用 +2 来保证在是真正已经产生变化了。
-            const timeoutTime = Math.min(nextChangeTimestamp - armedAt + 2, MAX_TIMEOUT)
+            const backoff = stalls === 0 ? 0 : Math.min(2 ** stalls, MAX_STALL_DELAY)
+            const timeoutTime = Math.min(Math.max(nextChangeTimestamp - armedAt + 2, backoff), MAX_TIMEOUT)
             const timeoutId = this.timeoutId = setTimeout(() => {
                 // timeoutId 非空 ⇔ 有一个尚未触发的 timer
                 if (this.timeoutId === timeoutId) this.timeoutId = null
@@ -154,8 +162,12 @@ export class RxTime {
                 //  走到这里说明没有 atom 变化。
                 result(compare(firedAt*coefficient + constant))
                 if (disposed || generation !== armedGeneration) return
-                if (firedAt <= nextChangeTimestamp && firedAt !== armedAt) {
-                    arm(coefficient, constant, firedAt, armedGeneration)
+                if (firedAt <= nextChangeTimestamp) {
+                    if (firedAt !== armedAt) {
+                        arm(coefficient, constant, firedAt, armedGeneration)
+                    } else if (stalls < MAX_STALLS) {
+                        arm(coefficient, constant, armedAt, armedGeneration, stalls + 1)
+                    }
                 }
             }, timeoutTime)
         }
