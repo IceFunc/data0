@@ -1279,4 +1279,67 @@ describe('destroy fast path for effects that cannot run user code', () => {
         expect(outerRuns).toBe(2)
         stop()
     })
+
+    // 销毁协议里其余可覆写的方法（review 发现）：2.16.0 每次销毁都以方法调用执行 destroyChildren()、
+    // cleanup()、dispatch('destroy')，覆写它们的子类不能因为快路径而被跳过。
+    test('with a destroyChildren() override: it is still called on destroy and on re-run', () => {
+        const dep = atom(0)
+        const seen: string[] = []
+        class Owning extends LightEffect {
+            destroyChildren() {
+                seen.push('destroyChildren')
+                super.destroyChildren()
+            }
+        }
+        const e = new Owning(() => { dep() })
+        seen.length = 0
+        dep(1)
+        expect(seen).toEqual(['destroyChildren'])
+        e.destroy()
+        expect(seen).toEqual(['destroyChildren', 'destroyChildren'])
+        expect(subscribers(dep)).toEqual([])
+    })
+
+    test('with a dispatch() override: it still sees the destroy event', () => {
+        const seen: string[] = []
+        class Forwarding extends LightEffect {
+            dispatch(event: string, arg?: any) {
+                seen.push(event)
+                super.dispatch(event, arg)
+            }
+        }
+        const e = new Forwarding(() => {})
+        let notified = 0
+        e.on('destroy', () => { notified++ })
+        seen.length = 0
+        e.destroy()
+        expect(seen).toEqual(['destroy'])
+        expect(notified).toBe(1)
+        const bare = new Forwarding(() => {})
+        seen.length = 0
+        bare.destroy()
+        expect(seen).toEqual(['destroy'])
+    })
+
+    test('with a cleanup() override: the reads in it are isolated', () => {
+        const read = atom(0)
+        const go = atom(0)
+        class Reading extends LightEffect {
+            cleanup() {
+                read()
+                super.cleanup()
+            }
+        }
+        const e = new Reading(() => {})
+        let outerRuns = 0
+        const stop = autorun(() => {
+            outerRuns++
+            if (go()) e.destroy()
+        }, true)
+        go(1)
+        expect(e.active).toBe(false)
+        read(1)
+        expect(outerRuns).toBe(2)
+        stop()
+    })
 })
