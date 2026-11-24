@@ -29,8 +29,9 @@ import {getComputedInternal} from '../src/computed'
  * Audit of the data0 core (atom / notify / dep / reactiveEffect / computed / common).
  *
  * F1..F8, X1..X5: found by this audit on v2.16.0 + the pending teardown-isolation PR. Every one of them
- *   failed there; they pass with the fixes in src/, except the two kept as `test.fails` (not fixed here,
- *   reason stated at each: F8's RxList.map onDestroy half and X5).
+ *   failed there; they pass with the fixes in src/, except X5, kept as `test.fails` (a contract decision,
+ *   reason stated there). F8's RxList.map onDestroy half is fixed by the list commit.
+ * R-X5 (`test.fails`): a known gap found in review, reason stated there.
  * S* / L*: copied from the collections / RxList reviewers (root cause in the core files); fixed here.
  * R*: regression tests for branches the fixes touch that the audit tests do not reach. Most fail on the
  *   pristine tree; the rest pin behaviour that must not change (sync first run, the DIRTY retry at digest…).
